@@ -33,7 +33,7 @@ from pathlib import Path
 
 STATE = Path(os.environ.get("RJOB_STATE", Path.home() / ".local/state/rjob")).expanduser()
 DEFAULT_RUNS = Path(os.environ.get("RJOB_RUNS_DIR", Path.home() / "rjob-runs")).expanduser()
-BATCH_BYTES = 1 << 30
+BATCH_BYTES = 256 << 20   # resume granularity; the transfer itself is streamed
 TERMINAL = {"done", "failed", "cancelled", "timeout", "dead"}
 
 
@@ -224,6 +224,21 @@ def cmd_wait(a) -> None:
         time.sleep(a.interval)
 
 
+def fetch_stream(host: str, job_id: str, paths: list[str], out: Path) -> None:
+    """Stream the host's tar.gz straight to disk; never hold a batch in memory (VM has ~3 GB)."""
+    proc = subprocess.Popen(ssh_cmd(host, ["fetch", job_id]), stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc.stdin.write("\n".join(paths).encode())
+    proc.stdin.close()
+    try:
+        with tarfile.open(fileobj=proc.stdout, mode="r|gz") as tar:
+            tar.extractall(out, filter="data")
+    finally:
+        err = proc.stderr.read().decode(errors="replace").strip()
+        if proc.wait() != 0:
+            die(f"fetch failed: {err}", proc.returncode or 1)
+
+
 def cmd_fetch(a) -> None:
     rec = local_record(a.id)
     dest = Path(a.dest) if a.dest else Path(rec.get("job", {}).get("runs_dir", DEFAULT_RUNS)) / a.id
@@ -245,9 +260,7 @@ def cmd_fetch(a) -> None:
             batch.append(m)
             size += m["size"]
         if batch and (m is None or size >= BATCH_BYTES):
-            data = remote(a.host, ["fetch", a.id], stdin="\n".join(b["path"] for b in batch).encode())
-            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-                tar.extractall(out, filter="data")
+            fetch_stream(a.host, a.id, [b["path"] for b in batch], out)
             batch, size = [], 0
     bad = [m["path"] for m in todo if sha256(out / m["path"]) != m["sha256"]]
     (dest / "manifest.json").write_text(json.dumps(manifest, indent=2))

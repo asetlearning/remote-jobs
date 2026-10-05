@@ -244,7 +244,7 @@ files = ["main.py"]
     # --- hostile commands over the locked channel
     hostile = ["", "ls", "bash -c id", "status ../../etc", "status 1;id", f"logs {jid} 10;id",
                "_supervise " + jid, "_tick", "push ../x", "push a/b", "has x notasha",
-               "cleanup job ..", "fetch $(id)", "logs 20990101-000000-abcdef", "status " + jid + " extra"]
+               "cleanup job ..", "fetch $(id)", "logs 20990101-000000-abcdef", "status " + jid + " extra", "status 'x"]
     bad = [c for c in hostile if host(c).returncode != 2]
     check(not bad, f"hostile commands rejected {bad}")
     p = subprocess.run([str(HOSTHOME / "rjob/bin/run-job")], input=b"../job.json\n", capture_output=True,

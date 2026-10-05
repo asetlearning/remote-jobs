@@ -795,7 +795,10 @@ USAGE = "usage: " + " | ".join(sorted(SSH_VERBS))
 def main(argv: list[str]) -> int:
     ensure_layout()
     if argv and argv[0] == "--ssh":
-        words = shlex.split(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
+        try:
+            words = shlex.split(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
+        except ValueError:  # unbalanced quotes
+            words = []
     else:
         if argv and argv[0] == "_supervise":
             supervise(argv[1])
