@@ -7,6 +7,8 @@ Covers push (incl. submodule), build reuse, submit, queue/slots, wait, fetch
 (+ resume, --include), provenance, dirty-tree refusal, cancel, timeout, data
 upload and hostile commands.  Run: python3 tests/test_runner.py
 """
+# Created by: Alex Myasnikov
+# Date: October 5, 2026
 import json
 import os
 import shutil

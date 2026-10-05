@@ -21,6 +21,8 @@ Layout under $RJOB_ROOT (default ~/rjob):
 
 Python 3.11+ standard library only.
 """
+# Created by: Alex Myasnikov
+# Date: October 5, 2026
 from __future__ import annotations
 
 import fnmatch

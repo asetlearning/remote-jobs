@@ -1,4 +1,7 @@
 #!/bin/bash
 # Forced command for the VM's SSH key (authorized_keys: restrict,command="$HOME/rjob/bin/run-job").
 # The client's command arrives in $SSH_ORIGINAL_COMMAND; run_job.py parses it against a verb whitelist.
+#
+# Created by: Alex Myasnikov
+# Date: October 5, 2026
 exec "$HOME/rjob/bin/python3" "$HOME/rjob/bin/run_job.py" --ssh

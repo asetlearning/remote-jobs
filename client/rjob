@@ -14,6 +14,8 @@ locked to run-job). $RJOB_SSH overrides the ssh command (tests).
 Local record of submitted jobs: ~/.local/state/rjob/jobs.jsonl.
 Python 3.11+ standard library only.
 """
+# Created by: Alex Myasnikov
+# Date: October 5, 2026
 from __future__ import annotations
 
 import argparse

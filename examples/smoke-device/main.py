@@ -2,6 +2,8 @@
 
 Run with the host's default Python (install.sh puts torch in ~/rjob/venv).
 """
+# Created by: Alex Myasnikov
+# Date: October 5, 2026
 import os
 
 import torch

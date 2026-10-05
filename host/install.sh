@@ -7,6 +7,9 @@
 #           ~/rjob/venv                                default Python with torch (script jobs, `info`)
 #           ~/rjob/config.toml                         slots and tool paths (kept if present)
 # Installs: uv (into ~/.local/bin) if missing.
+#
+# Created by: Alex Myasnikov
+# Date: October 5, 2026
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 R="$HOME/rjob"
