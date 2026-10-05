@@ -4,6 +4,9 @@ runs_dir = "~/Research/challenge-gen/runs"
 [code]
 path = "~/Research/challenge-gen/b25_pyproject_agentic"
 
+[code.submodules."cpp/tcgraph"]
+sha = "main"            # b25's committed pin c093277 predates scorers b25 binds
+
 [resources]
 device = "mps"
 cpus = 2
