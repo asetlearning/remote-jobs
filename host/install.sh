@@ -15,10 +15,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 R="$HOME/rjob"
 mkdir -p "$R/bin" "$R/mirrors" "$R/builds" "$R/data" "$R/jobs" "$R/locks"
 
-if ! command -v uv >/dev/null 2>&1 && [[ ! -x "$HOME/.local/bin/uv" ]]; then
+# Always the worker's own uv: never one from another user's home found on PATH.
+UV="$HOME/.local/bin/uv"
+if [[ ! -x "$UV" ]]; then
   curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh
 fi
-UV="$(command -v uv || echo "$HOME/.local/bin/uv")"
 
 "$UV" python install 3.12
 ln -sf "$("$UV" python find 3.12)" "$R/bin/python3"
