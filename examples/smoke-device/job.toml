@@ -1,0 +1,13 @@
+# No [code]: a self-contained script job run by the host's default Python.
+name = "smoke-device"
+runs_dir = "~/Research/challenge-gen/runs"
+
+[resources]
+device = "mps"
+cpus = 1
+timeout_hours = 0.25
+
+[run]
+argv = ["python", "main.py"]
+files = ["main.py"]
+outputs = "outputs"

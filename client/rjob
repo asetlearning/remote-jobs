@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""rjob — run heavy jobs on a remote host from the agent VM.
+
+    rjob submit JOB.toml [--host H] [--dry-run]    ship code + inputs, queue the job; prints job id
+    rjob status ID | logs ID [N] | list | cancel ID | info | provenance ID
+    rjob wait ID [--interval S]                    block until the job is finished; exit 0 iff done
+    rjob fetch ID [--dest DIR] [--include GLOB]... resumable download of the job's outputs
+    rjob push REPO_PATH [REV]                      ship a commit (normally done by submit)
+    rjob put-data FILE                             upload a large input once; prints sha256:...
+    rjob cleanup job ID | cleanup builds DAYS
+
+Host: --host, else $RJOB_HOST, else "mac" (an ~/.ssh/config alias whose key is
+locked to run-job). $RJOB_SSH overrides the ssh command (tests).
+Local record of submitted jobs: ~/.local/state/rjob/jobs.jsonl.
+Python 3.11+ standard library only.
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import io
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import tomllib
+from pathlib import Path
+
+STATE = Path(os.environ.get("RJOB_STATE", Path.home() / ".local/state/rjob")).expanduser()
+DEFAULT_RUNS = Path(os.environ.get("RJOB_RUNS_DIR", Path.home() / "rjob-runs")).expanduser()
+BATCH_BYTES = 1 << 30
+TERMINAL = {"done", "failed", "cancelled", "timeout", "dead"}
+
+
+def die(msg: str, code: int = 2):
+    print(f"rjob: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ------------------------------------------------------------------ transport
+
+def ssh_cmd(host: str, words: list[str]) -> list[str]:
+    base = shlex.split(os.environ.get("RJOB_SSH", "ssh -o BatchMode=yes"))
+    return base + [host, shlex.join(words)]
+
+
+def remote(host: str, words: list[str], stdin: bytes | None = None, check=True) -> bytes:
+    p = subprocess.run(ssh_cmd(host, words), input=stdin or b"", capture_output=True)
+    if check and p.returncode != 0:
+        die(f"{words[0]} failed: {p.stderr.decode(errors='replace').strip()}", p.returncode or 1)
+    return p.stdout
+
+
+def remote_stream(host: str, words: list[str], stdin_file) -> bytes:
+    p = subprocess.run(ssh_cmd(host, words), stdin=stdin_file, capture_output=True)
+    if p.returncode != 0:
+        die(f"{words[0]} failed: {p.stderr.decode(errors='replace').strip()}", p.returncode or 1)
+    return p.stdout
+
+
+# ----------------------------------------------------------------- local git
+
+def git(repo: Path, *args) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def repo_name(repo: Path) -> str:
+    try:
+        url = git(repo, "config", "remote.origin.url")
+    except subprocess.CalledProcessError:
+        return repo.resolve().name
+    return url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+
+
+def require_clean(repo: Path) -> None:
+    dirty = git(repo, "status", "--porcelain", "--ignore-submodules=none", "--untracked-files=no")
+    if dirty:
+        die(f"{repo} has uncommitted changes; commit them on an experiment branch first:\n{dirty}")
+
+
+def submodules(repo: Path) -> dict:
+    """{path: {"repo": name, "sha": checked-out sha, "local": Path}} for initialised submodules."""
+    out = {}
+    if not (repo / ".gitmodules").exists():
+        return out
+    status = subprocess.run(["git", "-C", str(repo), "submodule", "status"], check=True,
+                            capture_output=True, text=True).stdout  # not stripped: col 0 is a flag
+    for line in status.splitlines():
+        sha, path = line[1:].split()[:2]
+        if line[0] == "-":
+            die(f"submodule {path} is not initialised")
+        local = repo / path
+        out[path] = {"repo": repo_name(local), "sha": sha, "local": local}
+    return out
+
+
+def push_commit(host: str, local: Path, name: str, sha: str) -> None:
+    """Send `sha` as refs/rjob/<sha> in an incremental bundle, unless the host has it."""
+    if not remote(host, ["has", name, sha]).strip():
+        return
+    known = remote(host, ["refs", name]).decode().split()
+    known = [k for k in known if subprocess.run(["git", "-C", str(local), "cat-file", "-e", f"{k}^{{commit}}"],
+                                                 capture_output=True).returncode == 0]
+    ref = f"refs/rjob/{sha}"
+    git(local, "update-ref", ref, sha)
+    try:
+        bundle = subprocess.run(["git", "-C", str(local), "bundle", "create", "-", ref,
+                                 *[f"^{k}" for k in known]], check=True, capture_output=True).stdout
+    finally:
+        git(local, "update-ref", "-d", ref)
+    remote(host, ["push", name], stdin=bundle)
+    print(f"pushed {name}@{sha[:12]} ({len(bundle) / 2**20:.1f} MiB)", file=sys.stderr)
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def put_data(host: str, path: Path) -> str:
+    digest = sha256(path)
+    if remote(host, ["has-data", digest]).strip():
+        with open(path, "rb") as fh:
+            remote_stream(host, ["put-data", digest], fh)
+        print(f"uploaded {path} ({path.stat().st_size / 2**20:.1f} MiB)", file=sys.stderr)
+    return f"sha256:{digest}"
+
+
+# ------------------------------------------------------------------ commands
+
+def resolve_job(spec_path: Path, host: str, dry: bool) -> tuple[dict, Path]:
+    spec = tomllib.loads(spec_path.read_text())
+    base = spec_path.parent
+    job = {"name": spec.get("name", spec_path.stem), "resources": spec.get("resources", {}),
+           "run": dict(spec["run"])}
+    job["run"].setdefault("files", [])
+    code = spec.get("code")
+    if code:
+        local = Path(os.path.expanduser(code["path"]))
+        if not local.is_absolute():
+            local = (base / local).resolve()
+        require_clean(local)
+        name = code.get("repo", repo_name(local))
+        sha = git(local, "rev-parse", code.get("rev", "HEAD") if code.get("sha", "auto") == "auto" else code["sha"])
+        resolved = {"repo": name, "sha": sha, "branch": git(local, "rev-parse", "--abbrev-ref", "HEAD")}
+        subs = {}
+        overrides = code.get("submodules", {})
+        for path, sub in submodules(local).items():
+            require_clean(sub["local"])
+            ov = overrides.get(path, {})
+            s_sha = sub["sha"] if ov.get("sha", "auto") == "auto" else git(sub["local"], "rev-parse", ov["sha"])
+            subs[path] = {"repo": ov.get("repo", sub["repo"]), "sha": s_sha}
+            if not dry:
+                push_commit(host, sub["local"], subs[path]["repo"], s_sha)
+        resolved["submodules"] = subs
+        if "build_steps" in code:
+            resolved["build_steps"] = code["build_steps"]
+        if not dry:
+            push_commit(host, local, name, sha)
+        job["code"] = resolved
+    data = {}
+    for dest, src in spec.get("data", {}).items():
+        p = Path(os.path.expanduser(src))
+        p = p if p.is_absolute() else (base / p)
+        data[dest] = "dry-run" if dry else put_data(host, p)
+    if data:
+        job["data"] = data
+    job["runs_dir"] = str(Path(os.path.expanduser(spec.get("runs_dir", str(DEFAULT_RUNS)))))
+    return job, base
+
+
+def cmd_submit(a) -> None:
+    spec_path = Path(a.spec)
+    if spec_path.is_dir():
+        spec_path = spec_path / "job.toml"
+    job, base = resolve_job(spec_path, a.host, a.dry_run)
+    if a.dry_run:
+        print(json.dumps(job, indent=2))
+        return
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        raw = json.dumps(job, indent=2).encode()
+        info = tarfile.TarInfo("job.json")
+        info.size = len(raw)
+        tar.addfile(info, io.BytesIO(raw))
+        for f in job["run"]["files"]:
+            if not (base / f).is_file():
+                die(f"run.files entry {f} not found next to {spec_path}")
+            tar.add(base / f, arcname=f, recursive=False)
+    job_id = remote(a.host, ["submit"], stdin=buf.getvalue()).decode().strip()
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / "jobs.jsonl", "a") as fh:
+        fh.write(json.dumps({"id": job_id, "host": a.host, "submitted": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                             "spec": str(spec_path.resolve()), "job": job}) + "\n")
+    print(job_id)
+
+
+def local_record(job_id: str) -> dict:
+    rec = {}
+    path = STATE / "jobs.jsonl"
+    if path.exists():
+        for line in path.read_text().splitlines():
+            r = json.loads(line)
+            if r["id"] == job_id:
+                rec = r
+    return rec
+
+
+def cmd_wait(a) -> None:
+    while True:
+        st = json.loads(remote(a.host, ["status", a.id]))
+        if st["state"] in TERMINAL:
+            print(json.dumps(st))
+            sys.exit(0 if st["state"] == "done" else 1)
+        time.sleep(a.interval)
+
+
+def cmd_fetch(a) -> None:
+    rec = local_record(a.id)
+    dest = Path(a.dest) if a.dest else Path(rec.get("job", {}).get("runs_dir", DEFAULT_RUNS)) / a.id
+    out = dest / "outputs"
+    out.mkdir(parents=True, exist_ok=True)
+    manifest = json.loads(remote(a.host, ["manifest", a.id]))
+    if a.include:
+        manifest = [m for m in manifest if any(fnmatch.fnmatch(m["path"], g) for g in a.include)]
+    todo = [m for m in manifest if not ((out / m["path"]).is_file()
+                                        and (out / m["path"]).stat().st_size == m["size"]
+                                        and sha256(out / m["path"]) == m["sha256"])]
+    need = sum(m["size"] for m in todo)
+    free = shutil.disk_usage(dest).free
+    if need > free * 0.9:
+        die(f"need {need / 2**30:.2f} GiB but only {free / 2**30:.2f} GiB free at {dest}; use --include")
+    batch, size = [], 0
+    for m in todo + [None]:
+        if m is not None:
+            batch.append(m)
+            size += m["size"]
+        if batch and (m is None or size >= BATCH_BYTES):
+            data = remote(a.host, ["fetch", a.id], stdin="\n".join(b["path"] for b in batch).encode())
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+                tar.extractall(out, filter="data")
+            batch, size = [], 0
+    bad = [m["path"] for m in todo if sha256(out / m["path"]) != m["sha256"]]
+    (dest / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (dest / "provenance.json").write_bytes(remote(a.host, ["provenance", a.id]))
+    (dest / "status.json").write_bytes(remote(a.host, ["status", a.id]))
+    (dest / "log.txt").write_bytes(remote(a.host, ["logs", a.id, "100000"]))
+    if bad:
+        die(f"checksum mismatch: {bad}", 1)
+    print(f"{dest}  ({len(todo)} fetched, {len(manifest) - len(todo)} already present, "
+          f"{need / 2**20:.1f} MiB)")
+
+
+def passthrough(words):
+    def fn(a):
+        args = [getattr(a, w[1:]) if w.startswith("$") else w for w in words]
+        sys.stdout.buffer.write(remote(a.host, [x for x in args if x is not None]))
+    return fn
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="rjob", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--host", default=os.environ.get("RJOB_HOST", "mac"))
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    p = sp.add_parser("submit"); p.add_argument("spec"); p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_submit)
+    for name in ("status", "cancel", "provenance", "manifest"):
+        p = sp.add_parser(name); p.add_argument("id"); p.set_defaults(fn=passthrough([name, "$id"]))
+    p = sp.add_parser("logs"); p.add_argument("id"); p.add_argument("n", nargs="?", default="100")
+    p.set_defaults(fn=passthrough(["logs", "$id", "$n"]))
+    for name in ("list", "info"):
+        sp.add_parser(name).set_defaults(fn=passthrough([name]))
+    p = sp.add_parser("wait"); p.add_argument("id"); p.add_argument("--interval", type=float, default=60)
+    p.set_defaults(fn=cmd_wait)
+    p = sp.add_parser("fetch"); p.add_argument("id"); p.add_argument("--dest")
+    p.add_argument("--include", action="append"); p.set_defaults(fn=cmd_fetch)
+    p = sp.add_parser("push"); p.add_argument("path"); p.add_argument("rev", nargs="?", default="HEAD")
+    p.set_defaults(fn=lambda a: push_commit(a.host, Path(a.path), repo_name(Path(a.path)),
+                                            git(Path(a.path), "rev-parse", a.rev)))
+    p = sp.add_parser("put-data"); p.add_argument("file")
+    p.set_defaults(fn=lambda a: print(put_data(a.host, Path(a.file))))
+    p = sp.add_parser("cleanup"); p.add_argument("what", choices=["job", "builds"]); p.add_argument("arg")
+    p.set_defaults(fn=passthrough(["cleanup", "$what", "$arg"]))
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

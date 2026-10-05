@@ -1,0 +1,21 @@
+# Build b25_pyproject_agentic (+ its cpp/tcgraph submodule) at the checked-out
+# commits and check that the tcgraph_ext extension imports. The build is cached
+# per commit, so later jobs on the same SHAs start immediately.
+#
+# To build against a different tcgraph commit than the submodule pin, add:
+#   [code.submodules."cpp/tcgraph"]
+#   sha = "main"            # any rev that exists in the local submodule checkout
+name = "b25-build"
+runs_dir = "~/Research/challenge-gen/runs"
+
+[code]
+path = "~/Research/challenge-gen/b25_pyproject_agentic"
+
+[resources]
+device = "cpu"
+cpus = 6
+timeout_hours = 0.5
+
+[run]
+argv = ["python", "-c", "import os, tcgraph_ext, torch; os.makedirs('outputs', exist_ok=True); open('outputs/ok.txt','w').write(f'tcgraph_ext={tcgraph_ext.__file__} torch={torch.__version__} mps={torch.backends.mps.is_available()}\\n'); print(open('outputs/ok.txt').read())"]
+outputs = "outputs"

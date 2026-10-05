@@ -1,0 +1,12 @@
+# One random target challenge for the smoke run (cf. configs/generate_sample.yaml).
+output_dir: output/sample
+num_samples: 1
+seed: 42
+max_relator_len: 3
+num_generators: 2
+sampling:
+  min_factors: 1
+  max_factors: 4
+  conj_len_max: 3
+  min_expanded_len: 5
+workers: 2
