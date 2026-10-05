@@ -1,0 +1,71 @@
+# Created by: Alex Myasnikov
+# Date: May 14, 2026
+#
+# Remote smoke run (copied from b25 configs/pattern_boost_smoke.yaml; challenges path filled in by run.sh).
+
+output_dir: output/pb_smoke
+seed: 42
+
+relators:
+  max_relator_len: 3
+  num_generators: 2
+
+challenges:
+  path: __CHALLENGES__
+
+tokenizer:
+  use_bpe: false
+  vocab_size: 128
+
+model:
+  n_layer: 2
+  n_head: 2
+  n_embd: 64
+  n_positions: 128
+
+training:
+  batch_size: 8
+  epochs: 1
+  lr: 5.0e-4
+  log_every: 100
+
+initial_sampling:
+  n_initial: 80
+  min_factors: 1
+  max_factors: 4
+  min_expanded_len: 5
+  conj_len_max: 3
+
+generation:
+  n_samples: 10
+  max_length: 128
+  temperature: 1.0
+  top_k: 50
+  top_p: 0.95
+  batch_size: 8
+
+local_search:
+  beam_width: 5
+  max_steps: 10
+  num_conj_samples: 3
+  num_insert_samples: 3
+  conj_max_len: 3
+
+scoring:
+  type: hellinger  # hellinger | hamming | edit | word_product_length | abelianized_product_length | high_power_count | length_range | hybrid
+  penalize_trivial: false
+
+workflow:
+  num_iterations: 2
+  top_k: 10
+  max_pool_size: 25
+  parallel_workers: 2
+  save_every: 1
+  train_from_scratch: true
+
+logging:
+  level: info
+
+compression:
+  use_compression: false
+  compression_tokenizer: null  # path to BPETokenizerWordCompression model JSON

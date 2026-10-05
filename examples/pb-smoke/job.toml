@@ -1,0 +1,15 @@
+name = "pb-smoke"
+runs_dir = "~/Research/challenge-gen/runs"
+
+[code]
+path = "~/Research/challenge-gen/b25_pyproject_agentic"
+
+[resources]
+device = "mps"
+cpus = 2
+timeout_hours = 1
+
+[run]
+argv = ["bash", "run.sh"]
+files = ["run.sh", "configs/sample_small.yaml", "configs/pb_smoke_remote.yaml"]
+outputs = "output"

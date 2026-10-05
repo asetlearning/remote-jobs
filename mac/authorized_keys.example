@@ -1,0 +1,7 @@
+# ~gpuworker/.ssh/authorized_keys on the GPU host  (chmod 600; ~/.ssh chmod 700)
+#
+# One line per key. Replace the key material with the contents of the VM's ~/.ssh/rjob_mac.pub.
+#   restrict      -> no pty, no port/agent/X11 forwarding
+#   command=...   -> every login runs run-job, whatever the client asks for
+#   from=...      -> key accepted only from the Parallels shared network (check the VM's subnet)
+restrict,command="/Users/gpuworker/rjob/bin/run-job",from="10.211.55.*" ssh-ed25519 AAAA...REPLACE_ME... vm-agents->gpuworker

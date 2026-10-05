@@ -1,0 +1,15 @@
+# Append to the VM's ~/.ssh/config.
+# HostName: the Mac as seen from the VM — `ip route | grep default` (usually 10.211.55.2).
+
+Host mac
+    HostName 10.211.55.2
+    User gpuworker
+    IdentityFile ~/.ssh/rjob_mac
+    IdentitiesOnly yes
+
+# Future remote server — same run-job, select with RJOB_HOST=gpuserver
+# Host gpuserver
+#     HostName gpu.example.org
+#     User gpuworker
+#     IdentityFile ~/.ssh/gpuserver
+#     IdentitiesOnly yes
