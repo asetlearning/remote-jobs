@@ -1,7 +1,7 @@
 # One random target challenge for the smoke run (cf. configs/generate_sample.yaml).
 output_dir: output/sample
 num_samples: 1
-seed: 42
+seed: 7   # must differ from pb_smoke_remote.yaml (42), or the target is in the initial pool and training never runs
 max_relator_len: 3
 num_generators: 2
 sampling:
