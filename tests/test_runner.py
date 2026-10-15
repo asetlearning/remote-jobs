@@ -25,6 +25,7 @@ TMP = Path(tempfile.mkdtemp(prefix="rjob-test-"))
 HOSTHOME = TMP / "home-testhost"
 RJOB = [sys.executable, str(REPO / "client/rjob"), "--host", "testhost"]
 FAILS = []
+OLD_RUNNER_REV = "47b2e83"   # last runner before multi-host (#4); compatibility target
 
 
 def check(cond, msg):
@@ -254,8 +255,8 @@ def multi_host():
     r = rj("--project", str(proj), "submit", str(lone), "--dry-run")
     check(host_of(r) == "macx", "--project applies to a spec outside the project dir")
 
-    # a real runner from main (pre-multi-host): `info brief` falls back to full info
-    old = sh("git", "-C", str(REPO), "show", "main:host/run_job.py").stdout
+    # a real pre-multi-host runner: `info brief` falls back to full info
+    old = sh("git", "-C", str(REPO), "show", f"{OLD_RUNNER_REV}:host/run_job.py").stdout
     setup_host(TMP / "home-oldhost", "", runner=old)
     oi = rec.host_info("oldhost")
     check(oi is not None and "default_python" in oi and "free" not in oi, "old runner: info brief falls back to full info")
