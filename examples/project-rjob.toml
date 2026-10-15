@@ -1,0 +1,17 @@
+# Per-project host list. Copy to the project directory as rjob.toml, e.g.
+# ~/Research/challenge-gen/rjob.toml. rjob finds it by walking up from job.toml
+# (or from the current directory); --project / $RJOB_PROJECT / `project = ...` in
+# job.toml point to it explicitly.
+
+runs_dir = "runs"          # default for this project's jobs; relative to this file
+
+# Hosts in order of preference. A new job goes to the first host that can run its
+# device and has room now; if none has room, to the capable host with the shortest
+# queue. `host = "..."` in job.toml or `rjob --host` overrides placement.
+[[hosts]]
+alias = "mac"              # ~/.ssh/config alias, key locked to run-job
+devices = ["cpu", "mps"]   # optional; otherwise learned from `rjob info`
+
+[[hosts]]
+alias = "gpuserver"
+devices = ["cpu", "cuda"]

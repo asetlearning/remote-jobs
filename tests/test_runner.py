@@ -5,7 +5,9 @@ A fake `ssh` runs the forced-command shim exactly as sshd would: the client's
 command goes into $SSH_ORIGINAL_COMMAND and HOME points at a scratch host home.
 Covers push (incl. submodule), build reuse, submit, queue/slots, wait, fetch
 (+ resume, --include), provenance, dirty-tree refusal, cancel, timeout, data
-upload and hostile commands.  Run: python3 tests/test_runner.py
+upload and hostile commands; then multi-host: project file, placement by device
+and free capacity, recorded hosts, GPU id assignment and memory estimates.
+Each ssh alias gets its own host home (home-<alias>).  Run: python3 tests/test_runner.py
 """
 # Created by: Alex Myasnikov
 # Date: October 5, 2026
@@ -20,7 +22,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 TMP = Path(tempfile.mkdtemp(prefix="rjob-test-"))
-HOSTHOME = TMP / "hosthome"
+HOSTHOME = TMP / "home-testhost"
 RJOB = [sys.executable, str(REPO / "client/rjob"), "--host", "testhost"]
 FAILS = []
 
@@ -38,17 +40,23 @@ def sh(*cmd, cwd=None, check_rc=True, env=None, inp=None):
     return p
 
 
-def setup_host():
-    b = HOSTHOME / "rjob/bin"
+def setup_host(home=HOSTHOME, extra="", runner=None):
+    b = home / "rjob/bin"
     b.mkdir(parents=True)
-    shutil.copy(REPO / "host/run_job.py", b)
+    if runner is None:
+        shutil.copy(REPO / "host/run_job.py", b)
+    else:
+        (b / "run_job.py").write_text(runner)
     shutil.copy(REPO / "host/run-job", b)
     (b / "python3").symlink_to(sys.executable)
-    (HOSTHOME / "rjob/config.toml").write_text(
-        'gpu_slots = 1\ncpu_slots = 2\nkeep_awake = false\nuv = "/nonexistent/uv"\n')
+    base = 'gpu_slots = 1\ncpu_slots = 2\nkeep_awake = false\nuv = "/nonexistent/uv"\n'
+    keys = {line.split("=")[0].strip() for line in extra.splitlines()}
+    base = "".join(l + "\n" for l in base.splitlines() if l.split("=")[0].strip() not in keys)
+    (home / "rjob/config.toml").write_text(base + extra)
     fake = TMP / "fakessh"
-    fake.write_text(f'#!/bin/bash\n# fake ssh: $1 = host, $2 = command string\n'
-                    f'SSH_ORIGINAL_COMMAND="$2" HOME="{HOSTHOME}" exec "{HOSTHOME}/rjob/bin/run-job"\n')
+    fake.write_text(f'#!/bin/bash\n# fake ssh: $1 = host alias, $2 = command string\n'
+                    f'H="{TMP}/home-$1"\n[ -x "$H/rjob/bin/run-job" ] || {{ echo "ssh: unreachable $1" >&2; exit 255; }}\n'
+                    f'SSH_ORIGINAL_COMMAND="$2" HOME="$H" exec "$H/rjob/bin/run-job"\n')
     fake.chmod(0o755)
     os.environ["RJOB_SSH"] = str(fake)
     os.environ["RJOB_STATE"] = str(TMP / "state")
@@ -110,6 +118,187 @@ def wait_state(job_id, states, timeout=60):
     t0 = time.time()
     while time.time() - t0 < timeout:
         st = json.loads(rjob("status", job_id).stdout)
+        if st["state"] in states:
+            return st
+        time.sleep(0.3)
+    return st
+
+
+def load_client():
+    from importlib.machinery import SourceFileLoader
+    from importlib.util import module_from_spec, spec_from_loader
+    spec = spec_from_loader("rjob_client", SourceFileLoader("rjob_client", str(REPO / "client/rjob")))
+    mod = module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def multi_host():
+    """Two hosts: macx (mps, 1 GPU, 2 CPU slots) and gpux (cuda, GPUs 0+1, 4 CPU slots, 10 GB)."""
+    setup_host(TMP / "home-macx", 'devices = ["cpu", "mps"]\n')
+    setup_host(TMP / "home-gpux", 'devices = ["cpu", "cuda"]\ngpu_ids = [0, 1]\ncpu_slots = 4\nmem_gb = 10\n')
+    proj = TMP / "proj"
+    proj.mkdir()
+    (proj / "rjob.toml").write_text('runs_dir = "runs"\n[[hosts]]\nalias = "macx"\n[[hosts]]\nalias = "gpux"\n'
+                                     '[[hosts]]\nalias = "deadhost"\n')
+    bare = [sys.executable, str(REPO / "client/rjob")]
+
+    def rj(*args, check_rc=True, cwd=None):
+        return sh(*bare, *args, check_rc=check_rc, cwd=cwd)
+
+    sleeper = ("import os, time\nos.makedirs('outputs', exist_ok=True)\n"
+               "print('ORDER=' + os.environ.get('CUDA_DEVICE_ORDER', '<unset>'), flush=True)\n"
+               "print('CVD=' + os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>'), flush=True)\n"
+               "time.sleep(float(open('t').read()))\n")
+
+    def spec(name, res, t="30", extra=""):
+        return write_spec(proj / "jobs" / name, f'name = "{name}"\n{extra}[resources]\n{res}\n'
+                          '[run]\nargv = ["python", "main.py"]\nfiles = ["main.py", "t"]\n',
+                          {"main.py": sleeper, "t": t})
+
+    def host_of(r):
+        return r.stderr.split("host: ", 1)[1].split()[0] if "host: " in r.stderr else None
+
+    def cvd(jid, timeout=20):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            out = rj("logs", jid).stdout
+            if "CVD=" in out:
+                return out.split("CVD=", 1)[1].split()[0] if out.split("CVD=", 1)[1].strip() else ""
+            time.sleep(0.3)
+        return None
+
+    # placement by device
+    check(host_of(rj("submit", str(spec("p-cuda", 'device = "cuda"')), "--dry-run")) == "gpux", "cuda job placed on cuda host")
+    check(host_of(rj("submit", str(spec("p-mps", 'device = "mps"')), "--dry-run")) == "macx", "mps job placed on mps host")
+    check(host_of(rj("submit", str(spec("p-cpu", "cpus = 1")), "--dry-run")) == "macx", "cpu job placed on first host")
+    r = rj("submit", str(spec("p-mps-gpux", 'device = "mps"')), "--host", "gpux", check_rc=False)
+    check(r.returncode != 0 and "not available" in r.stderr, "host rejects a device it lacks")
+    r = rj("submit", str(spec("p-3gpu", 'device = "cuda"\ngpus = 3')), "--host", "gpux", check_rc=False)
+    check(r.returncode != 0 and "GPUs" in r.stderr, "host rejects more GPUs than it has")
+    r = rj("submit", str(spec("p-0gpu", 'device = "cuda"\ngpus = 0')), "--host", "gpux", check_rc=False)
+    check(r.returncode != 0 and "gpus >= 1" in r.stderr, "host rejects gpus = 0 for a GPU device")
+    r = rj("submit", str(spec("p-3gpu-place", 'device = "cuda"\ngpus = 3')), "--dry-run")
+    check("host: none" in r.stderr and "only 2 GPUs" in r.stderr, "placement skips hosts with too few GPUs in total")
+    r = rj("submit", str(spec("p-3gpu-place", 'device = "cuda"\ngpus = 3')), check_rc=False)
+    check(r.returncode != 0 and "no project host" in r.stderr, "real submit fails when no host can ever run the job")
+    r = sh(*bare, "submit", str(spec("p-env", "cpus = 1")), "--dry-run", env=dict(os.environ, RJOB_HOST="gpux"))
+    check(host_of(r) == "gpux", "$RJOB_HOST outranks the project file")
+    dead = proj / "dead.toml"
+    dead.write_text('[[hosts]]\nalias = "deadhost"\n[[hosts]]\nalias = "deadhost2"\n')
+    r = rj("--project", str(dead), "submit", str(spec("p-dead", "cpus = 1")), "--dry-run", check_rc=False)
+    check(r.returncode == 0 and "host: none" in r.stderr and "unreachable" in r.stderr,
+          "dry run with every host down reports instead of failing")
+    check(host_of(rj("submit", str(spec("p-pin", "cpus = 1", extra='host = "gpux"\n')), "--dry-run")) == "gpux",
+          "job.toml host pins placement")
+
+    # spill: fill macx's CPU slots, next CPU job goes to gpux; runs_dir from project
+    full = rj("submit", str(spec("fill-mac", "cpus = 2"))).stdout.strip()
+    wait_state_any(rj, full, {"running"})
+    r = rj("submit", str(spec("spill", "cpus = 1")))
+    spill = r.stdout.strip()
+    check(host_of(r) == "gpux", f"placement spills to the next host when the first is full ({host_of(r)})")
+    check(cvd(spill) == "", "cpu job on a cuda host sees no GPUs")
+    rec = load_client()
+    check(json.loads(rj("status", spill).stdout)["state"] in ("building", "running"), "status resolves the recorded host")
+    r = sh(*bare, "status", spill, cwd=proj, env=dict(os.environ, RJOB_STATE=str(TMP / "empty-state")))
+    check(r.returncode == 0 and json.loads(r.stdout)["state"] in ("building", "running"),
+          "job missing from the record is found on the project host that knows it")
+    r = sh(*bare, "status", spill, cwd=TMP, check_rc=False,
+           env={**{k: v for k, v in os.environ.items() if k != "RJOB_HOST"}, "RJOB_STATE": str(TMP / "empty-state")})
+    check(r.returncode != 0 and "unreachable mac" in r.stderr, "no record, no project: falls back to mac as before")
+    r = sh(*bare, "status", "20990101-000000-abcdef", check_rc=False, cwd=proj,
+           env={k: v for k, v in os.environ.items() if k != "RJOB_HOST"})
+    check(r.returncode != 0 and "no project host knows it" in r.stderr, "unknown job id asks for --host")
+    rec_runs = [json.loads(l) for l in (TMP / "state/jobs.jsonl").read_text().splitlines() if spill in l][0]
+    check(rec_runs["host"] == "gpux" and rec_runs["job"]["runs_dir"] == str(proj / "runs"),
+          "record keeps host; runs_dir defaults from project file")
+    for j in (full, spill):
+        rj("cancel", j)
+
+    # GPU ids: two cuda jobs get disjoint GPUs, a third waits
+    g = [rj("submit", str(spec(f"g{i}", 'device = "cuda"\ncpus = 1'))).stdout.strip() for i in range(3)]
+    ids = [cvd(j) for j in g[:2]]
+    check(sorted(ids) == ["0", "1"], f"concurrent cuda jobs get disjoint CUDA_VISIBLE_DEVICES {ids}")
+    time.sleep(1)
+    check(json.loads(rj("status", g[2]).stdout)["state"] == "queued", "third cuda job waits for a GPU")
+    prov = json.loads(rj("provenance", g[0]).stdout)
+    check(prov.get("gpu_ids") in ([0], [1]), "provenance records gpu ids")
+    check("ORDER=PCI_BUS_ID" in rj("logs", g[0]).stdout, "CUDA jobs get CUDA_DEVICE_ORDER=PCI_BUS_ID")
+    hosts = rj("hosts", cwd=proj).stdout
+    check("gpux" in hosts and "0/2" in hosts and "deadhost\tunreachable" in hosts, "rjob hosts shows load and unreachable hosts")
+    check(sum(l.startswith("gpux\t") for l in rj("--project", str(proj / "rjob.toml"), "list", "--all").stdout.splitlines()) == 4, "list --all prefixes hosts")
+    rj("cancel", g[0])
+    check(wait_state_any(rj, g[2], {"running"})["state"] == "running", "queued cuda job starts when a GPU frees")
+    check(cvd(g[2]) == ids[0], "freed GPU id is reused")
+    for j in g[1:]:
+        rj("cancel", j)
+
+    # memory estimates on gpux (10 GB)
+    m = [rj("submit", str(spec(f"m{i}", "cpus = 1\nmem_gb = 6")), "--host", "gpux").stdout.strip() for i in range(2)]
+    wait_state_any(rj, m[0], {"running"})
+    time.sleep(1)
+    check(json.loads(rj("status", m[1]).stdout)["state"] == "queued", "mem_gb blocks co-scheduling")
+    for j in m:
+        rj("cancel", j)
+    big = rj("submit", str(spec("mbig", "cpus = 1\nmem_gb = 64")), "--host", "gpux").stdout.strip()
+    check(wait_state_any(rj, big, {"running"})["state"] == "running", "oversize mem job runs alone")
+    rj("cancel", big)
+
+    # compat: no project file, no --host -> $RJOB_HOST (else mac)
+    lone = write_spec(TMP / "lone", 'name = "lone"\n[run]\nargv = ["python", "x.py"]\n')
+    r = sh(*bare, "submit", str(lone), "--dry-run", env=dict(os.environ, RJOB_HOST="testhost"))
+    check(host_of(r) == "testhost", "no project: $RJOB_HOST as before")
+    r = sh(*bare, "submit", str(lone), "--dry-run", env={k: v for k, v in os.environ.items() if k != "RJOB_HOST"})
+    check(host_of(r) == "mac", "no project, no $RJOB_HOST: mac as before")
+    r = rj("--project", str(proj), "submit", str(lone), "--dry-run")
+    check(host_of(r) == "macx", "--project applies to a spec outside the project dir")
+
+    # a real runner from main (pre-multi-host): `info brief` falls back to full info
+    old = sh("git", "-C", str(REPO), "show", "main:host/run_job.py").stdout
+    setup_host(TMP / "home-oldhost", "", runner=old)
+    oi = rec.host_info("oldhost")
+    check(oi is not None and "default_python" in oi and "free" not in oi, "old runner: info brief falls back to full info")
+    bi = rec.host_info("gpux")
+    check(bi is not None and "devices" in bi and "default_python" not in bi and "idle" in bi, "new runner: brief info")
+    pj = proj / "old.toml"
+    pj.write_text('[[hosts]]\nalias = "oldhost"\n[[hosts]]\nalias = "deadhost"\n')
+    r = rj("--project", str(pj), "submit", str(spec("p-old", "cpus = 1")), "--dry-run")
+    check(host_of(r) == "oldhost", "placement uses an idle old runner")
+
+    # oversize memory on an idle host fits, whatever the rounding
+    idle = {"free": {"gpu": 0, "cpu": 4, "mem_gb": 13.25}, "slots": {"gpu": 0, "cpu": 4, "mem_gb": 13.25},
+            "idle": True, "queue_len": 0}
+    check(rec.fits_now(idle, {"cpus": 1, "mem_gb": 20}) is True, "oversize mem job fits an idle host")
+    check(rec.fits_now(dict(idle, idle=False), {"cpus": 1, "mem_gb": 20}) is False, "oversize mem job waits on a busy host")
+
+    # installer resource detection, with a BSD-style seq that would add a trailing separator
+    stub = TMP / "stub"
+    stub.mkdir()
+    for name, body in {"uname": '[[ "$1" == -m ]] && echo x86_64 || echo Linux',
+                       "nvidia-smi": 'echo "GPU 0: A"; echo "GPU 1: B"',
+                       "seq": 'echo "0, 1, "'}.items():
+        (stub / name).write_text("#!/bin/bash\n" + body + "\n")
+        (stub / name).chmod(0o755)
+    env = dict(os.environ, PATH=f"{stub}:/usr/bin:/bin", HOME=str(TMP / "nohome"))
+    r = sh("bash", str(REPO / "host/install.sh"), "--print-config", env=env, check_rc=False)
+    check(r.returncode == 0 and "gpu_ids = [0, 1]" in r.stdout and not (TMP / "nohome").exists(),
+          "install.sh --print-config detects GPUs and installs nothing")
+    r = sh("bash", str(REPO / "host/install.sh"), "--print-config", env=dict(env, RJOB_GPU_IDS="0;x"), check_rc=False)
+    check(r.returncode != 0 and "bad resources" in r.stderr, "install.sh rejects a malformed override")
+
+    # placement against a runner that predates multi-host (no devices/free in info)
+    rec.host_info = lambda h: {"default_python": {"mps": h == "old", "cuda": False}, "running": [],
+                               "queued": [], "slots": {"gpu": 1, "cpu": 2}}
+    pr = {"hosts": [{"alias": "busy"}, {"alias": "old"}]}
+    check(rec.place(pr, {"device": "mps"})[0] == "old", "old-style info: device from default_python")
+    check(rec.place(pr, {"device": "cpu"})[0] == "busy", "old-style info: idle host is used")
+
+
+def wait_state_any(rj, job_id, states, timeout=30):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        st = json.loads(rj("status", job_id).stdout)
         if st["state"] in states:
             return st
         time.sleep(0.3)
@@ -263,6 +452,7 @@ files = ["main.py"]
     info = json.loads(rjob("info").stdout)
     check(info["slots"]["cpu"] == 2 and "builds" in info, "info reports slots and builds")
     print(rjob("list").stdout)
+    multi_host()
     print(f"\n{len(FAILS)} failures" if FAILS else "\nall checks passed")
     if not FAILS:
         shutil.rmtree(TMP, ignore_errors=True)

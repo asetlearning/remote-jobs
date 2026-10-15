@@ -1,0 +1,16 @@
+# The smoke-device job on a CUDA host: placement picks a project host with cuda.
+# main.py is a copy of ../smoke-device/main.py (run.files must sit next to job.toml).
+name = "smoke-device-cuda"
+runs_dir = "~/Research/challenge-gen/runs"
+
+[resources]
+device = "cuda"
+gpus = 1
+cpus = 1
+mem_gb = 2
+timeout_hours = 0.25
+
+[run]
+argv = ["python", "main.py"]
+files = ["main.py"]
+outputs = "outputs"

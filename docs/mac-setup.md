@@ -25,7 +25,7 @@ Some steps need an **admin on the Mac** and cannot be done from the VM. They are
    echo 'restrict,command="/Users/gpuworker/rjob/bin/run-job",from="10.211.55.*" ssh-ed25519 AAAA... vm-agents->gpuworker' >> ~/.ssh/authorized_keys
    chmod 600 ~/.ssh/authorized_keys
    ```
-6. **Slots (optional).** Edit `~/rjob/config.toml`. The defaults for an 8-core M1 are `gpu_slots = 1` and `cpu_slots = 7`.
+6. **Slots (optional).** Edit `~/rjob/config.toml`: `gpu_ids = [0]` (MPS is one device), `cpu_slots` (cores − 1) and `mem_gb` (85% of RAM; 0 = unlimited). Configs written before multi-host have `gpu_slots = 1` and no `mem_gb`, which behaves the same.
 
 ## VM
 
