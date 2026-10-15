@@ -22,7 +22,8 @@ This adds a Linux server (x86_64, NVIDIA GPUs or CPU only) as a remote-jobs host
    RJOB_ROOT=/scratch/gpuworker/rjob bash /path/to/remote-jobs/host/install.sh
    ```
    - It installs uv, Python 3.12, `~/rjob/venv` with torch (CUDA wheels on x86_64), `~/rjob/bin/{run-job,run_job.py}` and `~/rjob/config.toml`.
-   - The config gets `gpu_ids` from `nvidia-smi -L`, `cpu_slots` = cores − 1 and `mem_gb` = 85% of RAM.
+   - The config gets `gpu_ids` from `nvidia-smi -L`, `cpu_slots` = cores − 1 and `mem_gb` = 85% of RAM. Preview it first with `bash install.sh --print-config`, and override any value for a new config with `RJOB_GPU_IDS="0,1"` (`""` = no GPU), `RJOB_CPU_SLOTS=N` or `RJOB_MEM_GB=N` (0 = unlimited).
+   - Other Unix systems than Linux and macOS get CPU slots only (no memory budget, no GPUs) and a warning; use the overrides, or set `devices = [...]` in the config.
    - It checks the compiler, cmake and `nvidia-smi`, and prints `info`; `default_python.cuda` must be `true` on a GPU host.
    - Re-run it after `host/run_job.py` changes.
 4. **Authorized key (as gpuworker).** Use the VM public key from step 6. One line:
