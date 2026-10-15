@@ -16,11 +16,12 @@ Hosts are ~/.ssh/config aliases whose key is locked to run-job.
 Project: --project, else $RJOB_PROJECT, else `project = ...` in job.toml, else the
 nearest rjob.toml above job.toml (or above the current directory). It lists the
 project's hosts in order of preference and its default runs_dir.
-Host of a new job: --host, else `host = ...` in job.toml, else placed on the
-first project host that can run its device and has room now, else on the
-capable host with the shortest queue; without a project: $RJOB_HOST, else "mac".
-Commands on a job id use the host recorded at submit (--host overrides;
-$RJOB_HOST for jobs not in the record).
+Host of a new job: --host, else $RJOB_HOST, else `host = ...` in job.toml, else
+placed on the first project host that can run its device and has room now, else
+on the capable host with the shortest queue; without a project: "mac".
+Commands on a job id use the host recorded at submit; --host overrides. A job
+missing from the record: $RJOB_HOST, else the project host that knows the id,
+else "mac".
 $RJOB_SSH overrides the ssh command (tests).
 Local record of submitted jobs: ~/.local/state/rjob/jobs.jsonl.
 Python 3.11+ standard library only.
@@ -30,6 +31,7 @@ Python 3.11+ standard library only.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import fnmatch
 import hashlib
 import io
@@ -184,20 +186,32 @@ def project_hosts(proj: dict) -> list[str]:
 
 def default_host(a) -> str:
     """Host for commands that are not about one job (list, info, put-data, ...)."""
-    if a.host:
-        return a.host
+    if a.host or os.environ.get("RJOB_HOST"):
+        return a.host or os.environ["RJOB_HOST"]
     hosts = project_hosts(load_project(a.project))
-    return hosts[0] if hosts else os.environ.get("RJOB_HOST", "mac")
+    return hosts[0] if hosts else "mac"
 
 
 def host_info(host: str) -> dict | None:
-    p = subprocess.run(ssh_cmd(host, ["info"]), stdin=subprocess.DEVNULL, capture_output=True)
-    if p.returncode != 0:
-        return None
-    try:
-        return json.loads(p.stdout)
-    except json.JSONDecodeError:
-        return None
+    """`info brief` from the host, or full `info` from runners that predate it; None if unreachable."""
+    for words in (["info", "brief"], ["info"]):
+        p = subprocess.run(ssh_cmd(host, words), stdin=subprocess.DEVNULL, capture_output=True)
+        if p.returncode == 0:
+            try:
+                return json.loads(p.stdout)
+            except json.JSONDecodeError:
+                return None
+        if p.returncode != 2 or b"usage:" not in p.stderr:  # 2 + usage: verb form unknown, retry
+            return None
+    return None
+
+
+def host_infos(hosts: list[str]) -> dict[str, dict | None]:
+    """host_info for several hosts in parallel (one slow or dead host costs one timeout)."""
+    if not hosts:
+        return {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as ex:
+        return dict(zip(hosts, ex.map(host_info, hosts)))
 
 
 def info_devices(info: dict) -> set[str]:
@@ -228,32 +242,36 @@ def fits_now(info: dict, res: dict) -> bool | None:
     g, c, m = needs(res)
     if res.get("device") == "auto" and not slots.get("gpu"):
         g = 0
-    cpu_ok = c <= free["cpu"] or free["cpu"] == slots.get("cpu")      # oversize jobs run alone
-    mem_ok = free.get("mem_gb") is None or m <= free["mem_gb"] or free["mem_gb"] == slots.get("mem_gb")
+    idle = info.get("idle", not info.get("running"))
+    cpu_ok = c <= free["cpu"] or idle      # oversize jobs run alone on an idle host
+    mem_ok = free.get("mem_gb") is None or m <= free["mem_gb"] or idle
     return g <= free["gpu"] and cpu_ok and mem_ok and not info.get("queue_len")
 
 
-def place(proj: dict, res: dict) -> tuple[str, str]:
-    """(host, reason) for a new job across the project's hosts."""
+def place(proj: dict, res: dict, strict: bool = True) -> tuple[str | None, str]:
+    """(host, reason) for a new job across the project's hosts. strict=False (dry run)
+    returns (None, reason) instead of failing when no host can take the job."""
     device = res.get("device", "cpu")
-    capable, skipped = [], []
-    for h in proj["hosts"]:
-        alias = h["alias"]
-        declared = set(h["devices"]) if "devices" in h else None
-        if declared is not None and not can_run(device, declared):
-            skipped.append(f"{alias}: no {device}")
-            continue
-        info = host_info(alias)
+    gpus = needs(res)[0]
+    declared = {h["alias"]: set(h["devices"]) for h in proj["hosts"] if "devices" in h}
+    skipped = [f"{a}: no {device}" for a, d in declared.items() if not can_run(device, d)]
+    ask = [h["alias"] for h in proj["hosts"] if h["alias"] not in declared or can_run(device, declared[h["alias"]])]
+    capable = []
+    for alias, info in host_infos(ask).items():
+        total_gpus = info.get("slots", {}).get("gpu", 0) if info else 0
         if info is None:
             skipped.append(f"{alias}: unreachable")
-            continue
-        if not can_run(device, declared or info_devices(info)):
+        elif not can_run(device, declared.get(alias) or info_devices(info)):
             skipped.append(f"{alias}: no {device}")
-            continue
-        capable.append((alias, info))
+        elif gpus > total_gpus and not (device == "auto" and total_gpus == 0):
+            skipped.append(f"{alias}: only {total_gpus} GPUs")
+        else:
+            capable.append((alias, info))
     note = f" (skipped {'; '.join(skipped)})" if skipped else ""
     if not capable:
-        die(f"no project host can run device={device}{note}")
+        if not strict:
+            return None, f"no project host can run this job now{note}"
+        die(f"no project host can run device={device} with gpus={gpus}{note}")
     for alias, info in capable:
         if fits_now(info, res):
             return alias, f"fits now, free {info['free']}{note}"
@@ -264,27 +282,39 @@ def place(proj: dict, res: dict) -> tuple[str, str]:
     return alias, f"no host has room now; shortest queue ({len(info.get('queued', []))} queued){note}"
 
 
-def choose_host(a, spec: dict, proj: dict) -> tuple[str, str]:
+def choose_host(a, spec: dict, proj: dict) -> tuple[str | None, str]:
     if a.host:
         return a.host, "--host"
+    if os.environ.get("RJOB_HOST"):
+        return os.environ["RJOB_HOST"], "$RJOB_HOST"
     if spec.get("host"):
         return spec["host"], "job.toml host"
     hosts = project_hosts(proj)
     if len(hosts) == 1:
         return hosts[0], "only project host"
     if hosts:
-        return place(proj, spec.get("resources", {}))
-    return os.environ.get("RJOB_HOST", "mac"), "default (no project file)"
+        return place(proj, spec.get("resources", {}), strict=not a.dry_run)
+    return "mac", "default (no project file)"
 
 
 def job_host(a) -> str:
-    """Host of an existing job: --host, else the host recorded when it was submitted."""
-    if a.host:
-        return a.host
-    host = local_record(a.id).get("host") or os.environ.get("RJOB_HOST")
-    if not host:
-        die(f"job {a.id} is not in {STATE / 'jobs.jsonl'}; pass --host or set $RJOB_HOST")
-    return host
+    """Host of an existing job: --host, else the host recorded at submit, else
+    $RJOB_HOST, else the project host that knows the id, else "mac" (as before multi-host)."""
+    host = a.host or local_record(a.id).get("host") or os.environ.get("RJOB_HOST")
+    if host:
+        return host
+    hosts = project_hosts(load_project(a.project))
+    if not hosts:
+        return "mac"
+
+    def knows(h):
+        return subprocess.run(ssh_cmd(h, ["status", a.id]), stdin=subprocess.DEVNULL,
+                              capture_output=True).returncode == 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as ex:
+        found = [h for h, ok in zip(hosts, ex.map(knows, hosts)) if ok]
+    if not found:
+        die(f"job {a.id} is not in {STATE / 'jobs.jsonl'} and no project host knows it; pass --host")
+    return found[0]
 
 
 # ------------------------------------------------------------------ commands
@@ -339,7 +369,7 @@ def cmd_submit(a) -> None:
     spec = tomllib.loads(spec_path.read_text())
     proj = load_project(a.project, spec_path.parent, spec)
     host, why = choose_host(a, spec, proj)
-    print(f"host: {host} ({why})", file=sys.stderr)
+    print(f"host: {host or 'none'} ({why})", file=sys.stderr)
     job, base = resolve_job(spec_path, spec, proj, host, a.dry_run)
     if a.dry_run:
         print(json.dumps(job, indent=2))
@@ -459,14 +489,15 @@ def all_hosts(a) -> list[str]:
 
 def cmd_hosts(a) -> None:
     print("host\tdevices\tgpu free/total\tcpu free/total\tmem_gb free/total\trunning\tqueued")
-    for host in all_hosts(a):
-        info = host_info(host)
+    for host, info in host_infos(all_hosts(a)).items():
         if info is None:
             print(f"{host}\tunreachable")
             continue
         slots, free = info.get("slots", {}), info.get("free") or {}
         def pair(k):
-            return f"{free.get(k, '?')}/{slots.get(k) if slots.get(k) is not None else '-'}"
+            f, t = free.get(k, "?"), slots.get(k)
+            f = round(f, 1) if isinstance(f, float) else f
+            return f"{f}/{t if t is not None else '-'}"
         print(f"{host}\t{','.join(sorted(info_devices(info)))}\t{pair('gpu')}\t{pair('cpu')}\t{pair('mem_gb')}"
               f"\t{len(info.get('running', []))}\t{len(info.get('queued', []))}")
 
@@ -475,8 +506,12 @@ def cmd_list(a) -> None:
     if not a.all:
         sys.stdout.buffer.write(remote(default_host(a), ["list"]))
         return
-    for host in all_hosts(a):
-        p = subprocess.run(ssh_cmd(host, ["list"]), stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    def run_list(host):
+        return subprocess.run(ssh_cmd(host, ["list"]), stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    hosts = all_hosts(a)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as ex:
+        results = list(ex.map(run_list, hosts))
+    for host, p in zip(hosts, results):
         if p.returncode != 0:
             print(f"{host}\tunreachable", file=sys.stderr)
             continue

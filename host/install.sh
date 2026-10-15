@@ -53,7 +53,8 @@ config_toml() {
   if [[ -n "${RJOB_GPU_IDS+set}" ]]; then
     gpu_ids=${RJOB_GPU_IDS//,/, }
   else
-    gpu_ids=$( (( ngpu > 0 )) && seq -s ', ' 0 $((ngpu - 1)) || true)
+    gpu_ids=""                # no seq: BSD seq -s leaves a trailing separator
+    for (( i = 0; i < ngpu; i++ )); do gpu_ids+="${gpu_ids:+, }$i"; done
   fi
   if ! [[ "$cpu_slots" =~ ^[1-9][0-9]*$ && "$mem_gb" =~ ^[0-9]+$ && "$gpu_ids" =~ ^([0-9]+(,\ [0-9]+)*)?$ ]]; then
     echo "ERROR: bad resources: cpu_slots=$cpu_slots mem_gb=$mem_gb gpu_ids=$gpu_ids" >&2

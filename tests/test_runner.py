@@ -40,10 +40,13 @@ def sh(*cmd, cwd=None, check_rc=True, env=None, inp=None):
     return p
 
 
-def setup_host(home=HOSTHOME, extra=""):
+def setup_host(home=HOSTHOME, extra="", runner=None):
     b = home / "rjob/bin"
     b.mkdir(parents=True)
-    shutil.copy(REPO / "host/run_job.py", b)
+    if runner is None:
+        shutil.copy(REPO / "host/run_job.py", b)
+    else:
+        (b / "run_job.py").write_text(runner)
     shutil.copy(REPO / "host/run-job", b)
     (b / "python3").symlink_to(sys.executable)
     base = 'gpu_slots = 1\ncpu_slots = 2\nkeep_awake = false\nuv = "/nonexistent/uv"\n'
@@ -144,6 +147,7 @@ def multi_host():
         return sh(*bare, *args, check_rc=check_rc, cwd=cwd)
 
     sleeper = ("import os, time\nos.makedirs('outputs', exist_ok=True)\n"
+               "print('ORDER=' + os.environ.get('CUDA_DEVICE_ORDER', '<unset>'), flush=True)\n"
                "print('CVD=' + os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>'), flush=True)\n"
                "time.sleep(float(open('t').read()))\n")
 
@@ -172,6 +176,19 @@ def multi_host():
     check(r.returncode != 0 and "not available" in r.stderr, "host rejects a device it lacks")
     r = rj("submit", str(spec("p-3gpu", 'device = "cuda"\ngpus = 3')), "--host", "gpux", check_rc=False)
     check(r.returncode != 0 and "GPUs" in r.stderr, "host rejects more GPUs than it has")
+    r = rj("submit", str(spec("p-0gpu", 'device = "cuda"\ngpus = 0')), "--host", "gpux", check_rc=False)
+    check(r.returncode != 0 and "gpus >= 1" in r.stderr, "host rejects gpus = 0 for a GPU device")
+    r = rj("submit", str(spec("p-3gpu-place", 'device = "cuda"\ngpus = 3')), "--dry-run")
+    check("host: none" in r.stderr and "only 2 GPUs" in r.stderr, "placement skips hosts with too few GPUs in total")
+    r = rj("submit", str(spec("p-3gpu-place", 'device = "cuda"\ngpus = 3')), check_rc=False)
+    check(r.returncode != 0 and "no project host" in r.stderr, "real submit fails when no host can ever run the job")
+    r = sh(*bare, "submit", str(spec("p-env", "cpus = 1")), "--dry-run", env=dict(os.environ, RJOB_HOST="gpux"))
+    check(host_of(r) == "gpux", "$RJOB_HOST outranks the project file")
+    dead = proj / "dead.toml"
+    dead.write_text('[[hosts]]\nalias = "deadhost"\n[[hosts]]\nalias = "deadhost2"\n')
+    r = rj("--project", str(dead), "submit", str(spec("p-dead", "cpus = 1")), "--dry-run", check_rc=False)
+    check(r.returncode == 0 and "host: none" in r.stderr and "unreachable" in r.stderr,
+          "dry run with every host down reports instead of failing")
     check(host_of(rj("submit", str(spec("p-pin", "cpus = 1", extra='host = "gpux"\n')), "--dry-run")) == "gpux",
           "job.toml host pins placement")
 
@@ -184,9 +201,15 @@ def multi_host():
     check(cvd(spill) == "", "cpu job on a cuda host sees no GPUs")
     rec = load_client()
     check(json.loads(rj("status", spill).stdout)["state"] in ("building", "running"), "status resolves the recorded host")
-    r = sh(*bare, "status", "20990101-000000-abcdef", check_rc=False,
+    r = sh(*bare, "status", spill, cwd=proj, env=dict(os.environ, RJOB_STATE=str(TMP / "empty-state")))
+    check(r.returncode == 0 and json.loads(r.stdout)["state"] in ("building", "running"),
+          "job missing from the record is found on the project host that knows it")
+    r = sh(*bare, "status", spill, cwd=TMP, check_rc=False,
+           env={**{k: v for k, v in os.environ.items() if k != "RJOB_HOST"}, "RJOB_STATE": str(TMP / "empty-state")})
+    check(r.returncode != 0 and "unreachable mac" in r.stderr, "no record, no project: falls back to mac as before")
+    r = sh(*bare, "status", "20990101-000000-abcdef", check_rc=False, cwd=proj,
            env={k: v for k, v in os.environ.items() if k != "RJOB_HOST"})
-    check(r.returncode != 0 and "--host" in r.stderr, "unknown job id asks for --host")
+    check(r.returncode != 0 and "no project host knows it" in r.stderr, "unknown job id asks for --host")
     rec_runs = [json.loads(l) for l in (TMP / "state/jobs.jsonl").read_text().splitlines() if spill in l][0]
     check(rec_runs["host"] == "gpux" and rec_runs["job"]["runs_dir"] == str(proj / "runs"),
           "record keeps host; runs_dir defaults from project file")
@@ -201,6 +224,7 @@ def multi_host():
     check(json.loads(rj("status", g[2]).stdout)["state"] == "queued", "third cuda job waits for a GPU")
     prov = json.loads(rj("provenance", g[0]).stdout)
     check(prov.get("gpu_ids") in ([0], [1]), "provenance records gpu ids")
+    check("ORDER=PCI_BUS_ID" in rj("logs", g[0]).stdout, "CUDA jobs get CUDA_DEVICE_ORDER=PCI_BUS_ID")
     hosts = rj("hosts", cwd=proj).stdout
     check("gpux" in hosts and "0/2" in hosts and "deadhost\tunreachable" in hosts, "rjob hosts shows load and unreachable hosts")
     check(sum(l.startswith("gpux\t") for l in rj("--project", str(proj / "rjob.toml"), "list", "--all").stdout.splitlines()) == 4, "list --all prefixes hosts")
@@ -229,6 +253,39 @@ def multi_host():
     check(host_of(r) == "mac", "no project, no $RJOB_HOST: mac as before")
     r = rj("--project", str(proj), "submit", str(lone), "--dry-run")
     check(host_of(r) == "macx", "--project applies to a spec outside the project dir")
+
+    # a real runner from main (pre-multi-host): `info brief` falls back to full info
+    old = sh("git", "-C", str(REPO), "show", "main:host/run_job.py").stdout
+    setup_host(TMP / "home-oldhost", "", runner=old)
+    oi = rec.host_info("oldhost")
+    check(oi is not None and "default_python" in oi and "free" not in oi, "old runner: info brief falls back to full info")
+    bi = rec.host_info("gpux")
+    check(bi is not None and "devices" in bi and "default_python" not in bi and "idle" in bi, "new runner: brief info")
+    pj = proj / "old.toml"
+    pj.write_text('[[hosts]]\nalias = "oldhost"\n[[hosts]]\nalias = "deadhost"\n')
+    r = rj("--project", str(pj), "submit", str(spec("p-old", "cpus = 1")), "--dry-run")
+    check(host_of(r) == "oldhost", "placement uses an idle old runner")
+
+    # oversize memory on an idle host fits, whatever the rounding
+    idle = {"free": {"gpu": 0, "cpu": 4, "mem_gb": 13.25}, "slots": {"gpu": 0, "cpu": 4, "mem_gb": 13.25},
+            "idle": True, "queue_len": 0}
+    check(rec.fits_now(idle, {"cpus": 1, "mem_gb": 20}) is True, "oversize mem job fits an idle host")
+    check(rec.fits_now(dict(idle, idle=False), {"cpus": 1, "mem_gb": 20}) is False, "oversize mem job waits on a busy host")
+
+    # installer resource detection, with a BSD-style seq that would add a trailing separator
+    stub = TMP / "stub"
+    stub.mkdir()
+    for name, body in {"uname": '[[ "$1" == -m ]] && echo x86_64 || echo Linux',
+                       "nvidia-smi": 'echo "GPU 0: A"; echo "GPU 1: B"',
+                       "seq": 'echo "0, 1, "'}.items():
+        (stub / name).write_text("#!/bin/bash\n" + body + "\n")
+        (stub / name).chmod(0o755)
+    env = dict(os.environ, PATH=f"{stub}:/usr/bin:/bin", HOME=str(TMP / "nohome"))
+    r = sh("bash", str(REPO / "host/install.sh"), "--print-config", env=env, check_rc=False)
+    check(r.returncode == 0 and "gpu_ids = [0, 1]" in r.stdout and not (TMP / "nohome").exists(),
+          "install.sh --print-config detects GPUs and installs nothing")
+    r = sh("bash", str(REPO / "host/install.sh"), "--print-config", env=dict(env, RJOB_GPU_IDS="0;x"), check_rc=False)
+    check(r.returncode != 0 and "bad resources" in r.stderr, "install.sh rejects a malformed override")
 
     # placement against a runner that predates multi-host (no devices/free in info)
     rec.host_info = lambda h: {"default_python": {"mps": h == "old", "cuda": False}, "running": [],

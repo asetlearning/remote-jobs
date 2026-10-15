@@ -578,7 +578,9 @@ def supervise(job_id: str) -> None:
         gpu_ids = read_json(d / "state.json", {}).get("gpu_ids", [])
         env["RJOB_GPU_IDS"] = ",".join(map(str, gpu_ids))
         if "cuda" in host_devices(cfg):
-            # A job sees only the GPUs it was given; CPU jobs see none.
+            # A job sees only the GPUs it was given; CPU jobs see none. gpu_ids are
+            # nvidia-smi indices, which follow PCI bus order; CUDA's default is fastest-first.
+            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
             env["CUDA_VISIBLE_DEVICES"] = env["RJOB_GPU_IDS"]
         prov["gpu_ids"] = gpu_ids
         python = str(src / ".venv/bin/python") if src and (src / ".venv/bin/python").exists() else cfg["python"]
@@ -674,6 +676,8 @@ def validate_job(job: dict) -> None:
         raise UserError("bad cpus")
     if gpus < 0 or mem < 0:
         raise UserError("bad gpus or mem_gb")
+    if device in ("mps", "cuda", "gpu") and gpus < 1:
+        raise UserError(f"device {device} needs gpus >= 1 (use device = \"cpu\" for no GPU)")
     cfg = config()
     devs = host_devices(cfg)
     if device in ("mps", "cuda") and device not in devs:
@@ -815,7 +819,11 @@ def nvidia_gpus() -> list | None:
     return [dict(zip(keys, (x.strip() for x in line.split(",")))) for line in out.splitlines() if line.strip()]
 
 
-def cmd_info() -> None:
+def cmd_info(mode: str = "") -> None:
+    """Host capacity and load. `info brief` (used for placement) skips the torch probe,
+    nvidia-smi and the build list."""
+    if mode not in ("", "brief"):
+        raise UserError("usage: info [brief]")
     cfg = config()
     disk = shutil.disk_usage(ROOT)
     mem = None
@@ -826,18 +834,22 @@ def cmd_info() -> None:
     u = usage(cfg)
     pool = gpu_pool(cfg)
     mem_cap = float(cfg.get("mem_gb") or 0)
-    builds = {p.name: (p / "state").read_text().strip() for p in sorted((ROOT / "builds").iterdir())
-              if (p / "state").exists()}
-    print(json.dumps({"host": platform.node(), "platform": platform.platform(), "cpus": os.cpu_count(),
-                      "mem_gb": round(mem / 2**30, 1) if mem else None,
-                      "disk_free_gb": round(disk.free / 2**30, 1),
-                      "slots": {"gpu": len(pool), "cpu": cfg["cpu_slots"], "mem_gb": mem_cap or None},
-                      "free": {"gpu": len(u["free_gpu_ids"]), "cpu": max(0, cfg["cpu_slots"] - u["cpu"]),
-                               "mem_gb": round(max(0.0, mem_cap - u["mem_gb"]), 1) if mem_cap else None},
-                      "gpu_ids": pool, "devices": host_devices(cfg), "gpus": nvidia_gpus(),
-                      "running": [d.name for d in u["active"]], "queued": [d.name for d in u["queued"]],
-                      "queue_len": len(u["queued"]), "builds": builds,
-                      "default_python": probe_env(cfg["python"], dict(os.environ))}, indent=2))
+    info = {"host": platform.node(), "platform": platform.platform(), "cpus": os.cpu_count(),
+            "mem_gb": round(mem / 2**30, 1) if mem else None,
+            "disk_free_gb": round(disk.free / 2**30, 1),
+            "slots": {"gpu": len(pool), "cpu": cfg["cpu_slots"], "mem_gb": mem_cap or None},
+            "free": {"gpu": len(u["free_gpu_ids"]), "cpu": max(0, cfg["cpu_slots"] - u["cpu"]),
+                     "mem_gb": max(0.0, mem_cap - u["mem_gb"]) if mem_cap else None},
+            "idle": not u["active"],
+            "gpu_ids": pool, "devices": host_devices(cfg),
+            "running": [d.name for d in u["active"]], "queued": [d.name for d in u["queued"]],
+            "queue_len": len(u["queued"])}
+    if mode != "brief":
+        info["gpus"] = nvidia_gpus()
+        info["builds"] = {p.name: (p / "state").read_text().strip() for p in sorted((ROOT / "builds").iterdir())
+                          if (p / "state").exists()}
+        info["default_python"] = probe_env(cfg["python"], dict(os.environ))
+    print(json.dumps(info, indent=2))
 
 
 def cmd_cleanup(target: str, arg: str = "") -> None:
@@ -879,7 +891,7 @@ SSH_VERBS = {
     "put-data": (cmd_put_data, 1, 1), "has-data": (cmd_has_data, 1, 50),
     "submit": (cmd_submit, 0, 0), "status": (cmd_status, 1, 1), "logs": (cmd_logs, 1, 2),
     "list": (cmd_list, 0, 0), "cancel": (cmd_cancel, 1, 1), "manifest": (cmd_manifest, 1, 1),
-    "provenance": (cmd_provenance, 1, 1), "fetch": (cmd_fetch, 1, 1), "info": (cmd_info, 0, 0),
+    "provenance": (cmd_provenance, 1, 1), "fetch": (cmd_fetch, 1, 1), "info": (cmd_info, 0, 1),
     "cleanup": (cmd_cleanup, 1, 2), "tick": (lambda: tick(), 0, 0),
 }
 USAGE = "usage: " + " | ".join(sorted(SSH_VERBS))

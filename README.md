@@ -49,9 +49,9 @@ devices = ["cpu", "cuda"]
 ```
 
 - **Finding the project file:** `--project <dir|file>`, else `$RJOB_PROJECT`, else `project = "..."` in job.toml, else the nearest `rjob.toml` above job.toml (for other commands: above the current directory).
-- **Placing a new job:** `--host`, else `host = "..."` in job.toml, else the first project host that can run the job's device and has room now (free GPU ids, CPU slots and memory, empty queue), else the capable host with the shortest queue. Unreachable hosts are skipped. `submit` prints `host: <alias> (<reason>)` on stderr; `--dry-run` places without submitting.
+- **Placing a new job:** `--host`, else `$RJOB_HOST`, else `host = "..."` in job.toml, else the first project host that can run the job's device, has enough GPUs in total and has room now (free GPU ids, CPU slots and memory, empty queue), else the capable host with the shortest queue. Hosts are queried in parallel with a light `info brief`; unreachable ones are skipped. `submit` prints `host: <alias> (<reason>)` on stderr; `--dry-run` places without submitting and reports `host: none` instead of failing when no host can take the job.
 - **Without a project file** a new job goes, as before, to `--host`, else `$RJOB_HOST`, else `mac`.
-- **Commands on a job id** (`status`, `logs`, `wait`, `fetch`, `cancel`, `provenance`, `manifest`, `cleanup job`) use the host recorded at submit in `~/.local/state/rjob/jobs.jsonl`; `--host` overrides. A job missing from the record needs `--host` or `$RJOB_HOST` (before multi-host it silently went to `mac`).
+- **Commands on a job id** (`status`, `logs`, `wait`, `fetch`, `cancel`, `provenance`, `manifest`, `cleanup job`) use the host recorded at submit in `~/.local/state/rjob/jobs.jsonl`; `--host` overrides. A job missing from the record goes to `$RJOB_HOST`, else the project host that knows its id, else `mac` (as before multi-host).
 - `--host` and `--project` may come before or after the command.
 
 ## Job spec (`job.toml`)
@@ -88,7 +88,8 @@ outputs = "output"             # directory under the work dir that is returned
 - **The work directory** mirrors the build tree through symlinks, so relative paths such as `configs/` and `data/` keep working. Overlaid files, data and `outputs` are real files and directories. Jobs never modify the shared build.
 - **Interpreter.** `python` in `argv` runs the build's `.venv`; for jobs without `[code]` it runs the host's default venv.
 - **Environment.** Jobs see `RJOB_JOB_ID`, `RJOB_DEVICE`, `RJOB_CPUS`, `RJOB_GPU_IDS` and `PYTORCH_ENABLE_MPS_FALLBACK=1`. On CUDA hosts `CUDA_VISIBLE_DEVICES` holds the job's GPU ids (empty for CPU jobs), so `cuda:0` is the job's first GPU.
-- **Estimates.** `cpus`, `gpus` and `mem_gb` are reservations used by the host scheduler, not enforced limits. A job that asks for more CPUs or memory than the host has runs alone; more GPUs than the host has is refused. A host refuses devices it lacks (`cuda` on the Mac, `mps` on Linux).
+- **Estimates.** `cpus`, `gpus` and `mem_gb` are reservations used by the host scheduler, not enforced limits. A job that asks for more CPUs or memory than the host has runs alone; more GPUs than the host has is refused, and so is `gpus = 0` with a GPU device. A host refuses devices it lacks (`cuda` on the Mac, `mps` on Linux).
+- **GPU numbering.** CUDA jobs also get `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so CUDA's numbering matches `nvidia-smi` and the ids the scheduler reserved.
 
 ## Why not Docker on the Mac?
 
