@@ -6,13 +6,13 @@ This repo is the bridge from the sandboxed agent VM to remote compute hosts. Kee
 
 | Path | What |
 |---|---|
-| `host/run_job.py` | The whole host side: SSH verb dispatch, git mirrors, per-SHA builds, scheduler, supervisor, manifest, fetch. Stdlib only, Python 3.11+ |
+| `host/run_job.py` | The whole host side: SSH verb dispatch, git mirrors, per-SHA builds, scheduler (GPU ids, CPU slots, mem_gb), supervisor, manifest, fetch. Stdlib only, Python 3.11+ |
 | `host/run-job` | The forced-command shim that `authorized_keys` points at |
 | `host/install.sh` | Host setup, run as the worker account |
-| `client/rjob` | The VM client; stdlib only |
-| `examples/` | Job specs: `smoke-device`, `b25-build`, `pb-smoke` |
+| `client/rjob` | The VM client: project host lists (`rjob.toml`), placement, recorded hosts; stdlib only |
+| `examples/` | Job specs: `smoke-device`, `smoke-device-cuda`, `b25-build`, `pb-smoke`; `project-rjob.toml` (per-project host list) |
 | `tests/test_runner.py` | End-to-end test with a fake ssh; no real host needed |
-| `docs/` | `mac-setup.md`, `execution-policy.md` (local vs remote; why native, not Docker, on the Mac) |
+| `docs/` | `mac-setup.md`, `server-setup.md` (Linux/CUDA), `execution-policy.md` (local vs remote; backends) |
 
 ## Invariants (do not break)
 
@@ -26,7 +26,8 @@ This repo is the bridge from the sandboxed agent VM to remote compute hosts. Kee
    - The build key is a hash of the SHA, the submodule SHAs and the build steps.
    - `provenance.json` fields are a protected format that experiment notes depend on.
 3. **The shared build tree is read-only for jobs.** Work dirs are symlink farms, and overlay, data and outputs paths are real files and directories.
-4. **Job contract.** `job.json` has the keys `name`, `code{repo,sha,submodules,build_steps?}`, `resources{device,cpus,timeout_hours}`, `run{argv,files,outputs}`, `data` and `runs_dir`. It is protected: a future container backend must honour the same contract.
+4. **Job contract.** `job.json` has the keys `name`, `code{repo,sha,submodules,build_steps?}`, `resources{device,cpus,timeout_hours,gpus?,mem_gb?}`, `run{argv,files,outputs}`, `data` and `runs_dir`. It is protected: a future container or Slurm backend must honour the same contract. Changes are additive only.
+5. **Mixed versions.** The client must work with hosts that run an older `run_job.py` (hosts update only when their owner re-runs `install.sh`): new `info` fields are optional on the client side, new job fields optional on the host side.
 
 ## Workflow
 

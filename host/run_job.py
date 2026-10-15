@@ -11,6 +11,11 @@ account. It is reached in two ways:
 * Internally: the scheduler starts detached supervisors as
   `run_job.py _supervise <id>`. Internal verbs are refused on the --ssh path.
 
+Resources: each job asks for `gpus` (concrete ids from `gpu_ids`, exported as
+CUDA_VISIBLE_DEVICES on CUDA hosts), `cpus` and optionally `mem_gb`; tick()
+starts queued jobs while the estimates fit the host's config. A Slurm backend
+would replace tick() (and the client's host placement), behind the same contract.
+
 Layout under $RJOB_ROOT (default ~/rjob):
     config.toml            slots, tool paths (optional; defaults below)
     mirrors/<repo>.git     bare mirrors; pushed commits live at refs/rjob/<sha>
@@ -52,8 +57,11 @@ ROOT = Path(os.environ.get("RJOB_ROOT", Path.home() / "rjob")).expanduser()
 HERE = Path(__file__).resolve()
 
 DEFAULT_CONFIG = {
-    "gpu_slots": 1,
+    "gpu_slots": 1,               # used only when gpu_ids is absent: ids 0..gpu_slots-1
+    "gpu_ids": None,              # usable GPU indices, e.g. [0, 1]; [] = no GPU
     "cpu_slots": 7,
+    "mem_gb": 0,                  # memory budget for the sum of resources.mem_gb; 0 = unlimited
+    "devices": None,              # None = detect: cpu, plus mps (Apple silicon) / cuda (nvidia-smi)
     "uv": str(Path.home() / ".local/bin/uv"),
     "python": sys.executable,
     "keep_awake": True,
@@ -64,6 +72,7 @@ RE_SHA = re.compile(r"^[0-9a-f]{40}$")
 RE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 RE_ID = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
 RE_INT = re.compile(r"^[0-9]{1,6}$")
+GPU_DEVICES = ("mps", "cuda", "gpu", "auto")
 RE_RELPATH = re.compile(r"^(?!/)(?!.*(^|/)\.\.(/|$))[A-Za-z0-9._/+=@-]{1,400}$")
 
 TERMINAL = {"done", "failed", "cancelled", "timeout", "dead"}
@@ -82,6 +91,22 @@ def config() -> dict:
     if path.exists() and tomllib is not None:
         cfg.update(tomllib.loads(path.read_text()))
     return cfg
+
+
+def gpu_pool(cfg: dict) -> list[int]:
+    ids = cfg.get("gpu_ids")
+    return [int(i) for i in ids] if ids is not None else list(range(int(cfg.get("gpu_slots", 0))))
+
+
+def host_devices(cfg: dict) -> list[str]:
+    if cfg.get("devices"):
+        return list(cfg["devices"])
+    devs = ["cpu"]
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        devs.append("mps")
+    if shutil.which("nvidia-smi"):
+        devs.append("cuda")
+    return devs
 
 
 def ensure_layout() -> None:
@@ -433,10 +458,40 @@ def prepare_work(d: Path, job: dict, src: Path | None) -> Path:
 
 # ---------------------------------------------------------------- scheduler
 
-def job_needs(job: dict) -> tuple[int, int]:
+def job_needs(job: dict, cfg: dict | None = None) -> tuple[int, int, float]:
+    """(gpus, cpus, mem_gb) the job reserves. `auto` on a host without GPUs takes none."""
     res = job.get("resources", {})
-    gpu = 1 if res.get("device", "cpu") in ("mps", "cuda", "gpu", "auto") else 0
-    return gpu, int(res.get("cpus", 1))
+    gpu = 0
+    if res.get("device", "cpu") in GPU_DEVICES:
+        gpu = int(res.get("gpus", 1))
+        if res.get("device") == "auto" and cfg is not None and not gpu_pool(cfg):
+            gpu = 0
+    return gpu, int(res.get("cpus", 1)), float(res.get("mem_gb", 0))
+
+
+def usage(cfg: dict) -> dict:
+    """What ACTIVE jobs hold, plus the queue. Jobs started by an older runner have no
+    gpu_ids in state.json; they are charged the first free ids."""
+    pool = gpu_pool(cfg)
+    held, cpu, mem, active, queued, legacy = [], 0, 0.0, [], [], 0
+    for d in all_jobs():
+        st = job_state(d)
+        if st["state"] in ACTIVE:
+            job = read_json(d / "job.json", {})
+            g, c, m = job_needs(job, cfg)
+            if "gpu_ids" in st:
+                held += st["gpu_ids"]
+            else:
+                legacy += g
+            cpu += c
+            mem += m
+            active.append(d)
+        elif st["state"] == "queued":
+            queued.append(d)
+    free_ids = [i for i in pool if i not in held]
+    held += free_ids[:legacy]
+    return {"gpu_ids": held, "free_gpu_ids": free_ids[legacy:], "cpu": cpu, "mem_gb": mem,
+            "active": active, "queued": queued}
 
 
 def all_jobs() -> list[Path]:
@@ -444,34 +499,30 @@ def all_jobs() -> list[Path]:
 
 
 def tick() -> None:
-    """Start queued jobs (FIFO) while GPU and CPU slots allow."""
+    """Start queued jobs (FIFO) while GPU ids, CPU slots and memory allow."""
     cfg = config()
+    mem_cap = float(cfg.get("mem_gb") or 0)
     with flock("scheduler"):
-        used_gpu = used_cpu = 0
-        queued = []
-        for d in all_jobs():
-            st = job_state(d)
+        u = usage(cfg)
+        free_ids, used_cpu, used_mem = u["free_gpu_ids"], u["cpu"], u["mem_gb"]
+        for d in u["queued"]:
             job = read_json(d / "job.json", {})
-            if st["state"] in ACTIVE:
-                g, c = job_needs(job)
-                used_gpu += g
-                used_cpu += c
-            elif st["state"] == "queued":
-                queued.append((d, job))
-        for d, job in queued:
-            g, c = job_needs(job)
+            g, c, m = job_needs(job, cfg)
             # FIFO, but a smaller job may fill slots a bigger one is waiting for.
-            # A job asking for more CPUs than exist still runs, alone.
-            if used_gpu + g > cfg["gpu_slots"] or (used_cpu + c > cfg["cpu_slots"] and used_cpu > 0):
+            # A job asking for more CPUs or memory than exist still runs, alone.
+            if g > len(free_ids) or (used_cpu + c > cfg["cpu_slots"] and used_cpu > 0) \
+                    or (mem_cap and used_mem + m > mem_cap and used_mem > 0):
                 continue
+            ids, free_ids = free_ids[:g], free_ids[g:]
+            set_state(d, gpu_ids=ids)  # before the supervisor starts: it reads them
             log = open(d / "log.txt", "ab")
             proc = subprocess.Popen([sys.executable, str(HERE), "_supervise", d.name],
                                     stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                     start_new_session=True, env=dict(os.environ, RJOB_ROOT=str(ROOT)))
             log.close()
             set_state(d, state="building", pid=proc.pid, started=now())
-            used_gpu += g
             used_cpu += c
+            used_mem += m
 
 
 def spawn_tick() -> None:
@@ -499,7 +550,7 @@ def supervise(job_id: str) -> None:
     d = ROOT / "jobs" / job_id
     job = read_json(d / "job.json")
     cfg = config()
-    _, cpus = job_needs(job)
+    _, cpus, _ = job_needs(job, cfg)
     log = open(d / "log.txt", "a", buffering=1)
     prov = {"job_id": job_id, "job": job, "submitted": read_json(d / "state.json", {}).get("submitted"),
             "host": platform.node(), "platform": platform.platform(), "machine": platform.machine()}
@@ -522,7 +573,14 @@ def supervise(job_id: str) -> None:
         prov["data"] = job.get("data", {})
         env = build_env(src, cpus)
         env["RJOB_JOB_ID"] = job_id
-        env["RJOB_DEVICE"] = job.get("resources", {}).get("device", "cpu")
+        device = job.get("resources", {}).get("device", "cpu")
+        env["RJOB_DEVICE"] = device
+        gpu_ids = read_json(d / "state.json", {}).get("gpu_ids", [])
+        env["RJOB_GPU_IDS"] = ",".join(map(str, gpu_ids))
+        if "cuda" in host_devices(cfg):
+            # A job sees only the GPUs it was given; CPU jobs see none.
+            env["CUDA_VISIBLE_DEVICES"] = env["RJOB_GPU_IDS"]
+        prov["gpu_ids"] = gpu_ids
         python = str(src / ".venv/bin/python") if src and (src / ".venv/bin/python").exists() else cfg["python"]
         prov["runtime"] = probe_env(python, env)
         argv = list(job["run"]["argv"])
@@ -605,10 +663,25 @@ def validate_job(job: dict) -> None:
         if steps is not None and not all(isinstance(s, list) and s for s in steps):
             raise UserError("build_steps must be a list of argv lists")
     res = job.get("resources", {})
-    if res.get("device", "cpu") not in ("cpu", "mps", "cuda", "gpu", "auto"):
+    device = res.get("device", "cpu")
+    if device not in ("cpu",) + GPU_DEVICES:
         raise UserError("bad device")
-    if int(res.get("cpus", 1)) < 1:
+    try:
+        cpus, gpus, mem = int(res.get("cpus", 1)), int(res.get("gpus", 1)), float(res.get("mem_gb", 0))
+    except (TypeError, ValueError):
+        raise UserError("cpus, gpus and mem_gb must be numbers")
+    if cpus < 1:
         raise UserError("bad cpus")
+    if gpus < 0 or mem < 0:
+        raise UserError("bad gpus or mem_gb")
+    cfg = config()
+    devs = host_devices(cfg)
+    if device in ("mps", "cuda") and device not in devs:
+        raise UserError(f"device {device} not available on this host (has {', '.join(devs)})")
+    if device == "gpu" and not ({"mps", "cuda"} & set(devs)):
+        raise UserError("device gpu requested but this host has no GPU")
+    if job_needs(job, cfg)[0] > len(gpu_pool(cfg)):
+        raise UserError(f"job asks for {gpus} GPUs; this host has {len(gpu_pool(cfg))}")
     for p, ref in job.get("data", {}).items():
         if not RE_RELPATH.match(p) or not RE_SHA256.match(str(ref).removeprefix("sha256:")):
             raise UserError("bad data spec")
@@ -730,22 +803,40 @@ def cmd_fetch(job_id: str) -> None:
                     tar.add(p, arcname=str(p.relative_to(out)), recursive=False)
 
 
+def nvidia_gpus() -> list | None:
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,utilization.gpu",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=20).stdout
+    except Exception as exc:  # info must not fail on a driver hiccup
+        return [{"error": str(exc)}]
+    keys = ("index", "name", "mem_total_mb", "mem_used_mb", "util_pct")
+    return [dict(zip(keys, (x.strip() for x in line.split(",")))) for line in out.splitlines() if line.strip()]
+
+
 def cmd_info() -> None:
     cfg = config()
-    usage = shutil.disk_usage(ROOT)
+    disk = shutil.disk_usage(ROOT)
     mem = None
     if sys.platform == "darwin":
         mem = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout or 0)
     elif Path("/proc/meminfo").exists():
         mem = int(Path("/proc/meminfo").read_text().split()[1]) * 1024
-    running = [d.name for d in all_jobs() if job_state(d)["state"] in ACTIVE]
-    queued = [d.name for d in all_jobs() if job_state(d)["state"] == "queued"]
+    u = usage(cfg)
+    pool = gpu_pool(cfg)
+    mem_cap = float(cfg.get("mem_gb") or 0)
     builds = {p.name: (p / "state").read_text().strip() for p in sorted((ROOT / "builds").iterdir())
               if (p / "state").exists()}
     print(json.dumps({"host": platform.node(), "platform": platform.platform(), "cpus": os.cpu_count(),
                       "mem_gb": round(mem / 2**30, 1) if mem else None,
-                      "disk_free_gb": round(usage.free / 2**30, 1), "slots": {"gpu": cfg["gpu_slots"], "cpu": cfg["cpu_slots"]},
-                      "running": running, "queued": queued, "builds": builds,
+                      "disk_free_gb": round(disk.free / 2**30, 1),
+                      "slots": {"gpu": len(pool), "cpu": cfg["cpu_slots"], "mem_gb": mem_cap or None},
+                      "free": {"gpu": len(u["free_gpu_ids"]), "cpu": max(0, cfg["cpu_slots"] - u["cpu"]),
+                               "mem_gb": round(max(0.0, mem_cap - u["mem_gb"]), 1) if mem_cap else None},
+                      "gpu_ids": pool, "devices": host_devices(cfg), "gpus": nvidia_gpus(),
+                      "running": [d.name for d in u["active"]], "queued": [d.name for d in u["queued"]],
+                      "queue_len": len(u["queued"]), "builds": builds,
                       "default_python": probe_env(cfg["python"], dict(os.environ))}, indent=2))
 
 

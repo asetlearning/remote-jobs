@@ -32,8 +32,10 @@
 | Host | Backend | GPU | Why |
 |---|---|---|---|
 | Mac (M1, 64 GB) | native: per-SHA worktree + uv venv | MPS | Docker on macOS runs in a Linux VM without Metal, so containers would be CPU-only |
-| Linux/CUDA server (future) | container: `docker run --gpus all -v work:/work -w /work <image>` | CUDA (near-native with nvidia-container-toolkit) | Reproducible environment, and scales to clusters |
+| Linux server | native, same as the Mac (`docs/server-setup.md`) | CUDA (`CUDA_VISIBLE_DEVICES` per job) | Same setup as the Mac; nothing extra to maintain |
+| Linux/CUDA server (later, optional) | container: `docker run --gpus all -v work:/work -w /work <image>`, or Slurm scheduling | CUDA | Reproducible environment, and scales to clusters |
 
-- **The job contract is the same for both backends:** `argv`, cwd = the work dir, the `outputs` dir, and `provenance.json`. Moving a job to a server changes only `--host`.
+- **The job contract is the same for every backend:** `argv`, cwd = the work dir, the `outputs` dir, and `provenance.json`. Moving a job to another host changes only `--host` (or the project's host list).
+- **Which host.** A project's `rjob.toml` lists its hosts; `rjob submit` places each job on the first host that can run its device and has room. Give jobs honest `cpus`, `gpus` and `mem_gb` estimates: they decide placement and co-scheduling.
 - **Container images** should be built on the server or in CI for that architecture, not in the arm64 VM, where cross-building x86 C++ under QEMU is very slow.
 - **b25's `Dockerfile` is stale.** It runs `git submodule update` without `.git`, and its compose file forces `linux/amd64`. Fix it when the container backend is built.

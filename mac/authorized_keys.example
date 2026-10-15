@@ -1,4 +1,5 @@
-# ~gpuworker/.ssh/authorized_keys on the GPU host  (chmod 600; ~/.ssh chmod 700)
+# ~gpuworker/.ssh/authorized_keys on the Mac  (chmod 600; ~/.ssh chmod 700)
+# Linux servers: same line with /home/gpuworker/... and their own from= (docs/server-setup.md).
 #
 # One line per key. Replace the key material with the contents of the VM's ~/.ssh/rjob_mac.pub.
 #   restrict      -> no pty, no port/agent/X11 forwarding

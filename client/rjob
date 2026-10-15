@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 """rjob — run heavy jobs on a remote host from the agent VM.
 
-    rjob submit JOB.toml [--host H] [--dry-run]    ship code + inputs, queue the job; prints job id
-    rjob status ID | logs ID [N] | list | cancel ID | info | provenance ID
+    rjob [--host H] [--project P] COMMAND ...
+    rjob submit JOB.toml [--dry-run]               place, ship code + inputs, queue the job; prints job id
+    rjob status ID | logs ID [N] | cancel ID | provenance ID
     rjob wait ID [--interval S]                    block until the job is finished; exit 0 iff done
     rjob fetch ID [--dest DIR] [--include GLOB]... resumable download of the job's outputs
+    rjob hosts                                     capacity and load of every host of the project
+    rjob list [--all] | info                       jobs / info of one host (--all: every project host)
     rjob push REPO_PATH [REV]                      ship a commit (normally done by submit)
     rjob put-data FILE                             upload a large input once; prints sha256:...
     rjob cleanup job ID | cleanup builds DAYS
 
-Host: --host, else $RJOB_HOST, else "mac" (an ~/.ssh/config alias whose key is
-locked to run-job). $RJOB_SSH overrides the ssh command (tests).
+Hosts are ~/.ssh/config aliases whose key is locked to run-job.
+Project: --project, else $RJOB_PROJECT, else `project = ...` in job.toml, else the
+nearest rjob.toml above job.toml (or above the current directory). It lists the
+project's hosts in order of preference and its default runs_dir.
+Host of a new job: --host, else `host = ...` in job.toml, else placed on the
+first project host that can run its device and has room now, else on the
+capable host with the shortest queue; without a project: $RJOB_HOST, else "mac".
+Commands on a job id use the host recorded at submit (--host overrides;
+$RJOB_HOST for jobs not in the record).
+$RJOB_SSH overrides the ssh command (tests).
 Local record of submitted jobs: ~/.local/state/rjob/jobs.jsonl.
 Python 3.11+ standard library only.
 """
@@ -37,6 +48,8 @@ STATE = Path(os.environ.get("RJOB_STATE", Path.home() / ".local/state/rjob")).ex
 DEFAULT_RUNS = Path(os.environ.get("RJOB_RUNS_DIR", Path.home() / "rjob-runs")).expanduser()
 BATCH_BYTES = 256 << 20   # resume granularity; the transfer itself is streamed
 TERMINAL = {"done", "failed", "cancelled", "timeout", "dead"}
+GPU_DEVICES = ("mps", "cuda", "gpu", "auto")
+PROJECT_FILE = "rjob.toml"
 
 
 def die(msg: str, code: int = 2):
@@ -47,7 +60,7 @@ def die(msg: str, code: int = 2):
 # ------------------------------------------------------------------ transport
 
 def ssh_cmd(host: str, words: list[str]) -> list[str]:
-    base = shlex.split(os.environ.get("RJOB_SSH", "ssh -o BatchMode=yes"))
+    base = shlex.split(os.environ.get("RJOB_SSH", "ssh -o BatchMode=yes -o ConnectTimeout=15"))
     return base + [host, shlex.join(words)]
 
 
@@ -137,10 +150,146 @@ def put_data(host: str, path: Path) -> str:
     return f"sha256:{digest}"
 
 
+# ---------------------------------------------------------- project + hosts
+
+def load_project(explicit: str | None, start: Path | None = None, spec: dict | None = None) -> dict:
+    """The project file as a dict (+ "_dir"), or {} when there is none."""
+    ref, base = explicit or os.environ.get("RJOB_PROJECT"), Path.cwd()
+    if not ref and (spec or {}).get("project"):
+        ref, base = spec["project"], start  # relative to job.toml
+    if ref:
+        path = base / os.path.expanduser(ref)
+        path = path / PROJECT_FILE if path.is_dir() else path
+        if not path.is_file():
+            die(f"project file {path} not found")
+    else:
+        d = (start or Path.cwd()).resolve()
+        for cand in [d, *d.parents]:
+            if (cand / PROJECT_FILE).is_file():
+                path = cand / PROJECT_FILE
+                break
+        else:
+            return {}
+    proj = tomllib.loads(path.read_text())
+    proj["_dir"] = path.parent
+    for h in proj.get("hosts", []):
+        if "alias" not in h:
+            die(f"{path}: every [[hosts]] entry needs an alias")
+    return proj
+
+
+def project_hosts(proj: dict) -> list[str]:
+    return [h["alias"] for h in proj.get("hosts", [])]
+
+
+def default_host(a) -> str:
+    """Host for commands that are not about one job (list, info, put-data, ...)."""
+    if a.host:
+        return a.host
+    hosts = project_hosts(load_project(a.project))
+    return hosts[0] if hosts else os.environ.get("RJOB_HOST", "mac")
+
+
+def host_info(host: str) -> dict | None:
+    p = subprocess.run(ssh_cmd(host, ["info"]), stdin=subprocess.DEVNULL, capture_output=True)
+    if p.returncode != 0:
+        return None
+    try:
+        return json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def info_devices(info: dict) -> set[str]:
+    if "devices" in info:
+        return set(info["devices"])
+    dp = info.get("default_python", {})  # host runner predating multi-host
+    return {"cpu"} | {d for d in ("mps", "cuda") if dp.get(d)}
+
+
+def needs(res: dict) -> tuple[int, int, float]:
+    gpus = int(res.get("gpus", 1)) if res.get("device", "cpu") in GPU_DEVICES else 0
+    return gpus, int(res.get("cpus", 1)), float(res.get("mem_gb", 0))
+
+
+def can_run(device: str, devices: set[str]) -> bool:
+    if device in ("mps", "cuda"):
+        return device in devices
+    if device == "gpu":
+        return bool({"mps", "cuda"} & devices)
+    return True
+
+
+def fits_now(info: dict, res: dict) -> bool | None:
+    """True/False from the host's free capacity; None when the host does not report it."""
+    free, slots = info.get("free"), info.get("slots", {})
+    if free is None:
+        return None
+    g, c, m = needs(res)
+    if res.get("device") == "auto" and not slots.get("gpu"):
+        g = 0
+    cpu_ok = c <= free["cpu"] or free["cpu"] == slots.get("cpu")      # oversize jobs run alone
+    mem_ok = free.get("mem_gb") is None or m <= free["mem_gb"] or free["mem_gb"] == slots.get("mem_gb")
+    return g <= free["gpu"] and cpu_ok and mem_ok and not info.get("queue_len")
+
+
+def place(proj: dict, res: dict) -> tuple[str, str]:
+    """(host, reason) for a new job across the project's hosts."""
+    device = res.get("device", "cpu")
+    capable, skipped = [], []
+    for h in proj["hosts"]:
+        alias = h["alias"]
+        declared = set(h["devices"]) if "devices" in h else None
+        if declared is not None and not can_run(device, declared):
+            skipped.append(f"{alias}: no {device}")
+            continue
+        info = host_info(alias)
+        if info is None:
+            skipped.append(f"{alias}: unreachable")
+            continue
+        if not can_run(device, declared or info_devices(info)):
+            skipped.append(f"{alias}: no {device}")
+            continue
+        capable.append((alias, info))
+    note = f" (skipped {'; '.join(skipped)})" if skipped else ""
+    if not capable:
+        die(f"no project host can run device={device}{note}")
+    for alias, info in capable:
+        if fits_now(info, res):
+            return alias, f"fits now, free {info['free']}{note}"
+    for alias, info in capable:  # old runner: idle means it fits
+        if fits_now(info, res) is None and not info.get("running") and not info.get("queued"):
+            return alias, f"idle{note}"
+    alias, info = min(capable, key=lambda x: len(x[1].get("queued", [])) + len(x[1].get("running", [])))
+    return alias, f"no host has room now; shortest queue ({len(info.get('queued', []))} queued){note}"
+
+
+def choose_host(a, spec: dict, proj: dict) -> tuple[str, str]:
+    if a.host:
+        return a.host, "--host"
+    if spec.get("host"):
+        return spec["host"], "job.toml host"
+    hosts = project_hosts(proj)
+    if len(hosts) == 1:
+        return hosts[0], "only project host"
+    if hosts:
+        return place(proj, spec.get("resources", {}))
+    return os.environ.get("RJOB_HOST", "mac"), "default (no project file)"
+
+
+def job_host(a) -> str:
+    """Host of an existing job: --host, else the host recorded when it was submitted."""
+    if a.host:
+        return a.host
+    host = local_record(a.id).get("host") or os.environ.get("RJOB_HOST")
+    if not host:
+        die(f"job {a.id} is not in {STATE / 'jobs.jsonl'}; pass --host or set $RJOB_HOST")
+    return host
+
+
 # ------------------------------------------------------------------ commands
 
-def resolve_job(spec_path: Path, host: str, dry: bool) -> tuple[dict, Path]:
-    spec = tomllib.loads(spec_path.read_text())
+def resolve_job(spec_path: Path, spec: dict, proj: dict, host: str, dry: bool) -> tuple[dict, Path]:
     base = spec_path.parent
     job = {"name": spec.get("name", spec_path.stem), "resources": spec.get("resources", {}),
            "run": dict(spec["run"])}
@@ -176,7 +325,10 @@ def resolve_job(spec_path: Path, host: str, dry: bool) -> tuple[dict, Path]:
         data[dest] = "dry-run" if dry else put_data(host, p)
     if data:
         job["data"] = data
-    job["runs_dir"] = str(Path(os.path.expanduser(spec.get("runs_dir", str(DEFAULT_RUNS)))))
+    runs = spec.get("runs_dir")
+    if runs is None and "runs_dir" in proj:
+        runs = proj["_dir"] / os.path.expanduser(proj["runs_dir"])
+    job["runs_dir"] = str(Path(os.path.expanduser(str(runs or DEFAULT_RUNS))))
     return job, base
 
 
@@ -184,7 +336,11 @@ def cmd_submit(a) -> None:
     spec_path = Path(a.spec)
     if spec_path.is_dir():
         spec_path = spec_path / "job.toml"
-    job, base = resolve_job(spec_path, a.host, a.dry_run)
+    spec = tomllib.loads(spec_path.read_text())
+    proj = load_project(a.project, spec_path.parent, spec)
+    host, why = choose_host(a, spec, proj)
+    print(f"host: {host} ({why})", file=sys.stderr)
+    job, base = resolve_job(spec_path, spec, proj, host, a.dry_run)
     if a.dry_run:
         print(json.dumps(job, indent=2))
         return
@@ -198,10 +354,10 @@ def cmd_submit(a) -> None:
             if not (base / f).is_file():
                 die(f"run.files entry {f} not found next to {spec_path}")
             tar.add(base / f, arcname=f, recursive=False)
-    job_id = remote(a.host, ["submit"], stdin=buf.getvalue()).decode().strip()
+    job_id = remote(host, ["submit"], stdin=buf.getvalue()).decode().strip()
     STATE.mkdir(parents=True, exist_ok=True)
     with open(STATE / "jobs.jsonl", "a") as fh:
-        fh.write(json.dumps({"id": job_id, "host": a.host, "submitted": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        fh.write(json.dumps({"id": job_id, "host": host, "submitted": time.strftime("%Y-%m-%dT%H:%M:%S"),
                              "spec": str(spec_path.resolve()), "job": job}) + "\n")
     print(job_id)
 
@@ -218,8 +374,9 @@ def local_record(job_id: str) -> dict:
 
 
 def cmd_wait(a) -> None:
+    host = job_host(a)
     while True:
-        st = json.loads(remote(a.host, ["status", a.id]))
+        st = json.loads(remote(host, ["status", a.id]))
         if st["state"] in TERMINAL:
             print(json.dumps(st))
             sys.exit(0 if st["state"] == "done" else 1)
@@ -242,11 +399,12 @@ def fetch_stream(host: str, job_id: str, paths: list[str], out: Path) -> None:
 
 
 def cmd_fetch(a) -> None:
+    host = job_host(a)
     rec = local_record(a.id)
     dest = Path(a.dest) if a.dest else Path(rec.get("job", {}).get("runs_dir", DEFAULT_RUNS)) / a.id
     out = dest / "outputs"
     out.mkdir(parents=True, exist_ok=True)
-    manifest = json.loads(remote(a.host, ["manifest", a.id]))
+    manifest = json.loads(remote(host, ["manifest", a.id]))
     if a.include:
         manifest = [m for m in manifest if any(fnmatch.fnmatch(m["path"], g) for g in a.include)]
     todo = [m for m in manifest if not ((out / m["path"]).is_file()
@@ -262,49 +420,101 @@ def cmd_fetch(a) -> None:
             batch.append(m)
             size += m["size"]
         if batch and (m is None or size >= BATCH_BYTES):
-            fetch_stream(a.host, a.id, [b["path"] for b in batch], out)
+            fetch_stream(host, a.id, [b["path"] for b in batch], out)
             batch, size = [], 0
     bad = [m["path"] for m in todo if sha256(out / m["path"]) != m["sha256"]]
     (dest / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    (dest / "provenance.json").write_bytes(remote(a.host, ["provenance", a.id]))
-    (dest / "status.json").write_bytes(remote(a.host, ["status", a.id]))
-    (dest / "log.txt").write_bytes(remote(a.host, ["logs", a.id, "100000"]))
+    (dest / "provenance.json").write_bytes(remote(host, ["provenance", a.id]))
+    (dest / "status.json").write_bytes(remote(host, ["status", a.id]))
+    (dest / "log.txt").write_bytes(remote(host, ["logs", a.id, "100000"]))
     if bad:
         die(f"checksum mismatch: {bad}", 1)
     print(f"{dest}  ({len(todo)} fetched, {len(manifest) - len(todo)} already present, "
           f"{need / 2**20:.1f} MiB)")
 
 
-def passthrough(words):
+def passthrough(words, by_id=False):
     def fn(a):
         args = [getattr(a, w[1:]) if w.startswith("$") else w for w in words]
-        sys.stdout.buffer.write(remote(a.host, [x for x in args if x is not None]))
+        host = job_host(a) if by_id else default_host(a)
+        sys.stdout.buffer.write(remote(host, [x for x in args if x is not None]))
     return fn
+
+
+def cmd_cleanup(a) -> None:
+    if a.what == "job":
+        a.id = a.arg
+        host = job_host(a)
+    else:
+        host = default_host(a)
+    sys.stdout.buffer.write(remote(host, ["cleanup", a.what, a.arg]))
+
+
+def all_hosts(a) -> list[str]:
+    hosts = project_hosts(load_project(a.project))
+    if not hosts:
+        die("no project file with [[hosts]] found; pass --project or set $RJOB_PROJECT")
+    return hosts
+
+
+def cmd_hosts(a) -> None:
+    print("host\tdevices\tgpu free/total\tcpu free/total\tmem_gb free/total\trunning\tqueued")
+    for host in all_hosts(a):
+        info = host_info(host)
+        if info is None:
+            print(f"{host}\tunreachable")
+            continue
+        slots, free = info.get("slots", {}), info.get("free") or {}
+        def pair(k):
+            return f"{free.get(k, '?')}/{slots.get(k) if slots.get(k) is not None else '-'}"
+        print(f"{host}\t{','.join(sorted(info_devices(info)))}\t{pair('gpu')}\t{pair('cpu')}\t{pair('mem_gb')}"
+              f"\t{len(info.get('running', []))}\t{len(info.get('queued', []))}")
+
+
+def cmd_list(a) -> None:
+    if not a.all:
+        sys.stdout.buffer.write(remote(default_host(a), ["list"]))
+        return
+    for host in all_hosts(a):
+        p = subprocess.run(ssh_cmd(host, ["list"]), stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        if p.returncode != 0:
+            print(f"{host}\tunreachable", file=sys.stderr)
+            continue
+        for line in p.stdout.splitlines():
+            print(f"{host}\t{line}")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="rjob", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--host", default=os.environ.get("RJOB_HOST", "mac"))
+    common = argparse.ArgumentParser(add_help=False)  # --host/--project also after the command
+    for flag, default in (("--host", None), ("--project", None)):
+        ap.add_argument(flag, default=default)
+        common.add_argument(flag, default=argparse.SUPPRESS,
+                            help="ssh alias; overrides placement and the recorded host" if flag == "--host"
+                            else "project dir or rjob.toml (default: $RJOB_PROJECT or nearest rjob.toml)")
     sp = ap.add_subparsers(dest="cmd", required=True)
+    real_add = sp.add_parser
+    sp.add_parser = lambda name, **kw: real_add(name, parents=[common], **kw)
     p = sp.add_parser("submit"); p.add_argument("spec"); p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_submit)
     for name in ("status", "cancel", "provenance", "manifest"):
-        p = sp.add_parser(name); p.add_argument("id"); p.set_defaults(fn=passthrough([name, "$id"]))
+        p = sp.add_parser(name); p.add_argument("id"); p.set_defaults(fn=passthrough([name, "$id"], by_id=True))
     p = sp.add_parser("logs"); p.add_argument("id"); p.add_argument("n", nargs="?", default="100")
-    p.set_defaults(fn=passthrough(["logs", "$id", "$n"]))
-    for name in ("list", "info"):
-        sp.add_parser(name).set_defaults(fn=passthrough([name]))
+    p.set_defaults(fn=passthrough(["logs", "$id", "$n"], by_id=True))
+    sp.add_parser("info").set_defaults(fn=passthrough(["info"]))
+    p = sp.add_parser("list"); p.add_argument("--all", action="store_true"); p.set_defaults(fn=cmd_list)
+    sp.add_parser("hosts").set_defaults(fn=cmd_hosts)
     p = sp.add_parser("wait"); p.add_argument("id"); p.add_argument("--interval", type=float, default=60)
     p.set_defaults(fn=cmd_wait)
     p = sp.add_parser("fetch"); p.add_argument("id"); p.add_argument("--dest")
     p.add_argument("--include", action="append"); p.set_defaults(fn=cmd_fetch)
     p = sp.add_parser("push"); p.add_argument("path"); p.add_argument("rev", nargs="?", default="HEAD")
-    p.set_defaults(fn=lambda a: push_commit(a.host, Path(a.path), repo_name(Path(a.path)),
+    p.set_defaults(fn=lambda a: push_commit(default_host(a), Path(a.path), repo_name(Path(a.path)),
                                             git(Path(a.path), "rev-parse", a.rev)))
     p = sp.add_parser("put-data"); p.add_argument("file")
-    p.set_defaults(fn=lambda a: print(put_data(a.host, Path(a.file))))
+    p.set_defaults(fn=lambda a: print(put_data(default_host(a), Path(a.file))))
     p = sp.add_parser("cleanup"); p.add_argument("what", choices=["job", "builds"]); p.add_argument("arg")
-    p.set_defaults(fn=passthrough(["cleanup", "$what", "$arg"]))
+    p.set_defaults(fn=cmd_cleanup)
     a = ap.parse_args()
     a.fn(a)
 
