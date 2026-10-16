@@ -10,8 +10,10 @@ This repo is the bridge from the sandboxed agent VM to remote compute hosts. Kee
 | `host/run-job` | The forced-command shim that `authorized_keys` points at |
 | `host/install.sh` | Host setup, run as the worker account |
 | `client/rjob` | The VM client: project host lists (`rjob.toml`), placement, recorded hosts; stdlib only |
+| `client/capjob` | Local runs on the VM inside a memory/CPU cap (systemd user scope, oom_score_adj 1000); when the cap kills the job, it falls back to `rjob submit`. Stdlib only |
 | `examples/` | Job specs: `smoke-device`, `smoke-device-cuda`, `b25-build`, `pb-smoke`; `project-rjob.toml` (per-project host list) |
 | `tests/test_runner.py` | End-to-end test with a fake ssh; no real host needed |
+| `tests/test_capjob.py` | capjob: cap, exit codes, fallback paths, with a stub rjob (needs a systemd user session) |
 | `docs/` | `mac-setup.md`, `server-setup.md` (Linux/CUDA), `execution-policy.md` (local vs remote; backends) |
 
 ## Invariants (do not break)
@@ -31,7 +33,7 @@ This repo is the bridge from the sandboxed agent VM to remote compute hosts. Kee
 
 ## Workflow
 
-- Run `python3 tests/test_runner.py` before proposing a merge, and add checks for new behaviour.
+- Run `python3 tests/test_runner.py` and `python3 tests/test_capjob.py` before proposing a merge, and add checks for new behaviour.
 - New work goes on a branch named `NN-short-slug`. **Never merge to `main` without the owner's (Alex Myasnikov) approval.**
 - After changing `host/run_job.py`, the host must re-run `host/install.sh`, which copies the runner into `~/rjob/bin`.
 

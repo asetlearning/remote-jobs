@@ -34,6 +34,21 @@ rjob put-data big_input.json             # upload once per host (content-address
 rjob cleanup job <id> | rjob cleanup builds 30
 ```
 
+## Local runs: `capjob` (memory cap + rjob fallback)
+
+Local runs on the VM go through `capjob`, so that a runaway job is killed instead of the desktop session or the agent terminals. On 2026-10-15/16 an unbounded 6-worker job got Maestri killed by the kernel OOM killer twice.
+
+```bash
+capjob [--mem 2G] [--swap 1G] [--cpus 2] [--out DIR] [--rjob JOB.toml] [--no-fallback] -- CMD ...
+```
+
+- **The cap.** CMD runs in its own systemd user scope with `MemoryMax`, `MemorySwapMax` and `CPUQuota`, and with `oom_score_adj` 1000. Thread variables (`OMP_NUM_THREADS`, `MKL_…`, `OPENBLAS_…`, `RAYON_…`, `RJOB_CPUS`) default to `--cpus`.
+- **The fallback when the job is killed** (SIGKILL: its cap, or a system OOM):
+  1. With `--rjob JOB.toml`, that spec is submitted.
+  2. Otherwise a `job.toml` is generated under `<project>/jobs/capjob/<name>-<stamp>/`. `<project>` is the nearest `rjob.toml` above the cwd, else `$RJOB_PROJECT`, else `~/Research/challenge-gen`. The spec is submitted automatically when it is safe: CMD runs in a git repo with a clean tree, `--out` names the results directory, and no argument is an absolute path outside the repo.
+  3. Otherwise the draft is left there for the user to finish and submit.
+- **Exit codes:** the job's own code when it finishes; **75** = killed, draft left (action needed); **76** = killed and submitted (the job id is printed on stdout). `CAPJOB:` lines on stderr are for agents to parse.
+
 ## Hosts and projects
 
 Hosts are SSH aliases (`~/.ssh/config`), each with its own key locked to `run-job`. A project lists its hosts in an `rjob.toml` in the project directory, e.g. `~/Research/challenge-gen/rjob.toml` (template: `examples/project-rjob.toml`):

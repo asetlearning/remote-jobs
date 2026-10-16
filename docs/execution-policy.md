@@ -7,6 +7,8 @@
 - Data analysis of fetched results, plots, and vault notes.
 - Cheap checks on small sets, such as certificate re-expansion, abelianization, and ρ/D on up to a few hundred short words.
 
+**Run local work under `capjob`** (default cap 2 GB RAM, 1 GB swap, 2 CPUs). A job that outgrows the cap is killed, and falls back to `rjob` (see the README). Never re-run a killed job locally with a bigger cap.
+
 ## Remote (`rjob submit`)
 
 - **Anything that needs a GPU**: model training and sampling, including PatternBoost runs and sweeps.
