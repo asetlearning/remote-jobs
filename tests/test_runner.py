@@ -572,7 +572,7 @@ def rjob_power():
     jid = [json.loads(l)["id"] for l in (TMP / "state/jobs.jsonl").read_text().splitlines()
            if json.loads(l)["host"] == "pw"][-1]
     r = sh(*bare, "status", jid, env=env, check_rc=False)
-    check(r.returncode != 0 and "may be stopped: rjob power status pw" in r.stderr,
+    check(r.returncode != 0 and "now STOPPED: rjob power start pw" in r.stderr,
           "a command on a stopped cloud host says how to start it")
     rw = row()
     check(rw[1:4] == ["STOPPED", "0.55", "-"], f"power status of a stopped host {rw}")
@@ -603,6 +603,121 @@ def rjob_power():
     pconf.write_text(f'[hosts.pw]\nprovider = "../etc"\n')
     r = rp("start", "pw")
     check(r.returncode != 0 and "must name a module" in r.stderr, "provider names are plain module names")
+
+
+def start_on_submit():
+    """Part 3: placement counts a stopped on-demand host, and submit / fetch --start start it.
+    Hosts: odmac (free, max_hours 2) and odcloud (on-demand, fake provider, boot hook)."""
+    import io
+    import re
+    import tarfile
+    import threading
+    mac, home = TMP / "home-odmac", TMP / "home-odcloud"
+    setup_host(mac, "cpu_slots = 2\n")
+    setup_host(home, "cpu_slots = 2\n")
+    fake_state, down, marker = TMP / "od-fake.json", home / "DOWN", home / "rjob/power/stopping"
+    fake_state.write_text(json.dumps({"state": "STOPPED", "calls": []}))
+    down.touch()
+    boot = ["env", f"RJOB_ROOT={home}/rjob", sys.executable, str(home / "rjob/bin/run_job.py"), "_power-boot"]
+    pconf = TMP / "od-power.toml"
+    pconf.write_text(f'[hosts.odcloud]\nprovider = "fake"\n[hosts.odcloud.fake]\nstate_file = "{fake_state}"\n'
+                     f'down_marker = "{down}"\non_start = {json.dumps(boot)}\n')
+    pconf.chmod(0o600)
+    proj = TMP / "odproj"
+    proj.mkdir()
+    (proj / "rjob.toml").write_text('runs_dir = "runs"\n[[hosts]]\nalias = "odmac"\nmax_hours = 2\n'
+                                    '[[hosts]]\nalias = "odcloud"\ndevices = ["cpu"]\ncost_per_hour = 0.55\n'
+                                    'power = "on-demand"\n')
+    env = dict(os.environ, RJOB_POWER_CONFIG=str(pconf), RJOB_POWER_POLL="0.3")
+    bare = [sys.executable, str(REPO / "client/rjob"), "--project", str(proj)]
+
+    def rj(*args, check_rc=False):
+        return sh(*bare, *args, env=env, check_rc=check_rc)
+
+    def spec(name, hours, extra=""):
+        return str(write_spec(proj / "jobs" / name, f'name = "{name}"\n{extra}[resources]\ncpus = 1\n'
+                              f'timeout_hours = {hours}\n[run]\nargv = ["python", "main.py"]\nfiles = ["main.py"]\n',
+                              {"main.py": "import os\nos.makedirs('outputs', exist_ok=True)\n"
+                                          "open('outputs/r.txt', 'w').write('ok')\n"}))
+
+    def calls():
+        return json.loads(fake_state.read_text())["calls"]
+
+    def cloud_stop():  # what autostop's provider call does
+        st = json.loads(fake_state.read_text())
+        fake_state.write_text(json.dumps({**st, "state": "STOPPED"}))
+        down.touch()
+
+    host_of = lambda r: r.stderr.split("host: ", 1)[-1].split(" ", 1)[0]
+    r = rj("submit", spec("od-short", 1), "--dry-run")
+    check(host_of(r) == "odmac" and calls() == [], f"short job goes to the free host; nothing started {r.stderr!r}")
+    r = rj("submit", spec("od-long", 3), "--dry-run")
+    check(host_of(r) == "odcloud" and "stopped; no running host has room now, starting it" in r.stderr
+          and "dry run: submit would start odcloud" in r.stderr and calls() == [],
+          f"long job placed on the stopped on-demand host; dry run starts nothing {r.stderr!r}")
+    r = rj("submit", spec("od-long", 3), "--dry-run", "--no-start")
+    check(host_of(r) == "odmac" and "odcloud: stopped (--no-start)" in r.stderr, "--no-start passes over a stopped host")
+    r = rj("submit", spec("od-long", 3))
+    jid = r.stdout.strip()
+    check(r.returncode == 0 and "starting odcloud (0.55/h)" in r.stderr and calls() == ["start"] and not down.exists(),
+          f"submit starts the stopped host, then queues the job {r.stderr[-300:]!r}")
+    check(wait_state_any(lambda *a: rj(*a, check_rc=True), jid, {"done"})["state"] == "done", "the job runs on the started host")
+    rows = [l.split("\t") for l in rj("power", "status", "odcloud").stdout.splitlines()[1:]]
+    check(rows and rows[0][4].startswith("no check since boot"), f"a watchdog decision from before the boot is shown as stale {rows}")
+    r = rj("submit", spec("od-long2", 3))
+    check(r.returncode == 0 and calls() == ["start"] and "starting" not in r.stderr, "a running on-demand host is used as is")
+    cloud_stop()
+    r = rj("status", jid)
+    check(r.returncode != 0 and "now STOPPED: rjob power start odcloud" in r.stderr and calls() == ["start"],
+          "status on a stopped host names the state and starts nothing")
+    r = rj("fetch", jid)
+    check(r.returncode != 0 and calls() == ["start"], "fetch without --start starts nothing")
+    r = rj("fetch", jid, "--start")
+    check(r.returncode == 0 and calls() == ["start", "start"] and (proj / "runs" / jid / "outputs/r.txt").read_text() == "ok",
+          f"fetch --start starts the host and fetches {r.stderr[-300:]!r}")
+    cloud_stop()
+    r = rj("--host", "odcloud", "submit", spec("od-pin-ns", 1), "--no-start")
+    check(r.returncode != 0 and calls() == ["start", "start"], "a pinned stopped host with --no-start is not started")
+    r = rj("--host", "odcloud", "submit", spec("od-pin", 1))
+    check(r.returncode == 0 and calls()[-1] == "start" and len(calls()) == 3, "a pinned stopped on-demand host is started")
+    # autostop has set its marker and is about to stop the host: wait for the stop, start, submit
+    marker.write_text("now\n")
+    threading.Timer(1.5, cloud_stop).start()
+    r = rj("submit", spec("od-race", 3))
+    check(r.returncode == 0 and "is stopping; starting it again" in r.stderr and calls()[-1] == "start" and len(calls()) == 4
+          and not marker.exists(), f"a stopping host is started again once stopped, then gets the job {r.stderr[-300:]!r}")
+    # a marker from before this boot (the boot unit has not run yet) does not count as stopping
+    marker.write_text("old\n")
+    os.utime(marker, (1, 1))
+    r = rj("submit", spec("od-stale", 3))
+    check(r.returncode == 0 and len(calls()) == 4 and marker.exists(), "a stale stopping marker neither blocks nor delays a submit")
+    marker.unlink()
+    # the marker appears between the check and the submit: refused, started again, resubmitted once
+    cl = load_client()
+    cl.POWER_CONFIG = pconf
+    started = []
+    cl.power_start = lambda *a: (started.append(a[0]), marker.unlink())
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        raw = json.dumps({"name": "od-retry", "resources": {}, "run": {"argv": ["true"], "files": []},
+                          "runs_dir": str(proj / "runs")}).encode()
+        ti = tarfile.TarInfo("job.json")
+        ti.size = len(raw)
+        tar.addfile(ti, io.BytesIO(raw))
+    marker.write_text("now\n")
+    jr = cl.submit_payload("odcloud", buf.getvalue(), True, 0.55)
+    check(started == ["odcloud"] and re.match(r"^\d{8}-\d{6}-[0-9a-f]{6}$", jr), f"a 'host is stopping' refusal is retried once ({jr})")
+    marker.write_text("now\n")
+    try:
+        cl.submit_payload("odcloud", buf.getvalue(), False, 0.55)
+        check(False, "an unmanaged host's refusal is not retried")
+    except SystemExit:
+        check(started == ["odcloud"], "an unmanaged host's refusal is not retried")
+    marker.unlink()
+    for bad in ('power = "always"\ndevices = ["cpu"]', 'power = "on-demand"'):
+        (proj / "bad.toml").write_text(f'[[hosts]]\nalias = "x"\n{bad}\n')
+        r = sh(sys.executable, str(REPO / "client/rjob"), "--project", str(proj / "bad.toml"), "hosts", check_rc=False)
+        check(r.returncode != 0 and "on-demand" in r.stderr, f"rjob.toml power field validated: {bad!r}")
 
 
 def nebius_setup_scripts():
@@ -896,6 +1011,7 @@ files = ["main.py"]
     multi_host()
     autostop()
     rjob_power()
+    start_on_submit()
     nebius_setup_scripts()
     print(f"\n{len(FAILS)} failures" if FAILS else "\nall checks passed")
     if not FAILS:

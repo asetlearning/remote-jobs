@@ -6,9 +6,10 @@ for `idle_minutes` (default 30). Disks persist while it is stopped: builds, mirr
 data and job results are all still there after the next start.
 
 - **Stopping** is decided on the host, by itself (below).
-- **Starting** is done from the agents' VM with `rjob power start <alias>`, using a key
-  that may only power-operate the listed cloud VMs (see "Starting from the VM").
-- **Next:** `rjob submit` will start a stopped host on demand; that is part 3 of issue #10.
+- **Starting** is done from the agents' VM, using a key that may only power-operate the
+  listed cloud VMs (see "Starting from the VM"): `rjob submit` starts a stopped
+  `power = "on-demand"` host when placement picks it, and `rjob power start <alias>` or
+  `rjob fetch <id> --start` start one on request.
 
 ## Why it works this way
 
@@ -113,9 +114,9 @@ For the manual steps behind the scripts, see Nebius's
 | `rjob power stop ALIAS [--cancel]` | Asks the host to stop once it is idle (`request-stop`). The client never calls the provider's stop, so a busy host is never stopped through rjob. |
 | `rjob power hold ALIAS HOURS` | Keeps the host up (≤ 12 h; `0` clears it). Use it before a series of jobs or a long fetch session. |
 
-- **Stopped hosts are reported, not started.** Any other command that cannot reach a host
-  listed in `power.toml` says it may be stopped and names the two commands above. Only
-  `rjob power start` starts a host for now; automatic starts on submit come in part 3.
+- **Only `submit` starts a host by itself** (next section). Any other command that cannot
+  reach a host listed in `power.toml` reports its cloud state and names `rjob power start`
+  and `rjob fetch <id> --start`; it starts nothing.
 - **Config.** `~/.config/rjob/power.toml` (`$RJOB_POWER_CONFIG`) must be mode 600; rjob
   refuses it otherwise. It holds one `[hosts.<alias>]` table per cloud VM: `provider`,
   plus `instance_id`, `profile` and `cli` in `[hosts.<alias>.nebius]`.
@@ -155,6 +156,40 @@ For the manual steps behind the scripts, see Nebius's
    - For further cloud VMs, run it again without `--credentials`.
 4. **Check:** `rjob power status`.
 
+## Start on submit
+
+A project opts a host in with `power = "on-demand"` in its `rjob.toml` entry. The entry
+must list `devices` (a stopped host cannot report them), and the host must also be in the
+VM's `power.toml`; without that it is treated as an ordinary host.
+
+```toml
+[[hosts]]
+alias = "cpuserver"
+devices = ["cpu"]
+cost_per_hour = 0.55
+power = "on-demand"
+```
+
+- **Placement.** For an on-demand host the client asks the cloud API first, so a stopped
+  host costs no ssh timeout. A stopped (or stopping, or booting) host counts as a capable
+  *cold* host, including for the `max_hours` rule. A running host that fits now still
+  wins; the cold host is chosen when no running host has room, before queueing on a busy
+  one. So with the Mac at `max_hours = 2`, a job over 2 h starts `cpuserver`, and a short
+  job queues on the Mac rather than wait.
+- **Start.** `submit` prints `starting cpuserver (0.55/h)`, starts it, waits up to 10 min
+  until its runner accepts jobs, then ships code and data and queues the job. A GPU job is
+  checked against the started host's real GPU count. `--dry-run` says it *would* start
+  the host and starts nothing; `--no-start` passes over stopped hosts.
+- **Pinned host.** `--host`, `$RJOB_HOST`, `host = ...` in job.toml or a single project
+  host: an on-demand host is started the same way (not with `--no-start`).
+- **A host that is stopping.** If autostop has decided to stop the host (its runner's
+  `stopping` marker, or cloud state `STOPPING`), `submit` waits until it is `STOPPED`,
+  starts it again and submits. If the marker appears between that check and the submit,
+  the host refuses with `host is stopping`; `submit` then does the same and resubmits once.
+  A marker older than the host's current boot is stale and does not count.
+- **Status after a start.** Until the watchdog's first check after boot, `rjob power
+  status` shows `no check since boot at ...` instead of the decision from before the stop.
+
 ## Operating
 
 - **Last decision:** `rjob --host <alias> info` → `power.autostop.decision`, or on the
@@ -163,7 +198,8 @@ For the manual steps behind the scripts, see Nebius's
 - **Pause:** `rjob power hold <alias> <hours>` (`0` clears it), or on the host
   `sudo systemctl stop rjob-autostop.timer`. Resume with
   `sudo systemctl start rjob-autostop.timer`.
-- **Start:** `rjob power start <alias>`, or the Nebius console.
+- **Start:** `rjob submit` (on-demand hosts), `rjob power start <alias>`,
+  `rjob fetch <id> --start`, or the Nebius console.
 - **Stop now (once idle):** `rjob power stop <alias>`.
 - **Remove:** `sudo bash host/power/install-autostop.sh --uninstall`. It keeps
   `/etc/rjob-power`.

@@ -2,10 +2,11 @@
 """rjob — run heavy jobs on a remote host from the agent VM.
 
     rjob [--host H] [--project P] COMMAND ...
-    rjob submit JOB.toml [--dry-run]               place, ship code + inputs, queue the job; prints job id
+    rjob submit JOB.toml [--dry-run] [--no-start]  place, ship code + inputs, queue the job; prints job id
     rjob status ID | logs ID [N] | cancel ID | provenance ID
     rjob wait ID [--interval S]                    block until the job is finished; exit 0 iff done
-    rjob fetch ID [--dest DIR] [--include GLOB]... resumable download of the job's outputs
+    rjob fetch ID [--dest DIR] [--include GLOB]... [--start]
+                                                   resumable download of the job's outputs
     rjob hosts                                     capacity, load, cost and hour limit of every project host
     rjob cost [--since YYYY-MM-DD] [--host H]      hours and cost of recorded jobs, per job and per host
     rjob power status [ALIAS]                      cloud state, autostop decision, hold of power-managed hosts
@@ -27,13 +28,17 @@ Host of a new job: --host, else $RJOB_HOST, else `host = ...` in job.toml, else
 placed on the first project host that can run its device and has room now, else on
 the capable host with the shortest queue, passing over hosts whose max_hours is below
 the job's timeout_hours while another capable host exists; without a project: "mac".
+A host with power = "on-demand" (and devices) that is listed in power.toml may be
+stopped: placement counts it as a cold host, used when no running host fits now, and
+submit starts it first (--no-start: never). A pinned on-demand host is started too.
 Commands on a job id use the host recorded at submit; --host overrides. A job
 missing from the record: $RJOB_HOST, else the project host that knows the id,
 else "mac".
 Power: ~/.config/rjob/power.toml ($RJOB_POWER_CONFIG, mode 600) lists the cloud hosts
 rjob may start, with their provider and instance (docs/power.md). The client only reads
 state and starts; stops are decided by the host's autostop (request-stop), so a busy
-host is never stopped through rjob.
+host is never stopped through rjob. Only submit starts a host by itself; fetch --start
+and rjob power start do it on request.
 $RJOB_SSH overrides the ssh command (tests).
 Local record of submitted jobs: ~/.local/state/rjob/jobs.jsonl.
 Python 3.11+ standard library only.
@@ -70,6 +75,8 @@ GPU_DEVICES = ("mps", "cuda", "gpu", "auto")
 PROJECT_FILE = "rjob.toml"
 DEFAULT_TIMEOUT_HOURS = 24  # the host runner's default for resources.timeout_hours
 POWER_CONFIG = Path(os.environ.get("RJOB_POWER_CONFIG", Path.home() / ".config/rjob/power.toml")).expanduser()
+POWER_POLL = float(os.environ.get("RJOB_POWER_POLL", 10))   # seconds between cloud-state polls (tests: less)
+START_TIMEOUT = 600   # seconds from a start until the runner accepts jobs
 PROVIDERS = Path(__file__).resolve().parents[1] / "host/power"   # providers/ shared with the host watchdog
 
 
@@ -89,10 +96,12 @@ def remote_failed(host: str, words: list[str], p) -> None:
     msg = f"{words[0]} failed: {p.stderr.decode(errors='replace').strip()}"
     try:
         managed = p.returncode == 255 and host in power_hosts(quiet=True)  # ssh could not connect
+        state = provider_state(host) if managed else ""
     except Exception:  # a broken power.toml must not hide the real error
         managed = False
     if managed:
-        msg += f"\n{host} is a cloud host and may be stopped: rjob power status {host}; rjob power start {host}"
+        msg += (f"\n{host} is a cloud host, now {state}: rjob power start {host} "
+                f"(or rjob fetch ID --start); rjob power status {host}")
     die(msg, p.returncode or 1)
 
 
@@ -212,6 +221,9 @@ def load_project(explicit: str | None, start: Path | None = None, spec: dict | N
             if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))
                                   or (v < low if low is not None else v <= 0)):
                 die(f"{path}: host {h['alias']}: {key} must be a number {'>= 0' if low is not None else '> 0'}")
+        if "power" in h and (h["power"] != "on-demand" or "devices" not in h):
+            die(f'{path}: host {h["alias"]}: power must be "on-demand", with devices listed '
+                f"(a stopped host cannot report them)")
     return proj
 
 
@@ -230,6 +242,11 @@ def too_long(entry: dict, res: dict) -> str | None:
     if limit is not None and job_hours(res) > limit:
         return f"max_hours {limit:g} < timeout_hours {job_hours(res):g}"
     return None
+
+
+def on_demand(proj: dict, alias: str) -> bool:
+    """rjob may start this host: power = "on-demand" in the project and listed in power.toml."""
+    return host_entry(proj, alias).get("power") == "on-demand" and alias in power_hosts(quiet=True)
 
 
 def project_hosts(proj: dict) -> list[str]:
@@ -300,18 +317,44 @@ def fits_now(info: dict, res: dict) -> bool | None:
     return g <= free["gpu"] and cpu_ok and mem_ok and not info.get("queue_len")
 
 
-def place(proj: dict, res: dict, strict: bool = True) -> tuple[str | None, str]:
-    """(host, reason) for a new job across the project's hosts. strict=False (dry run)
-    returns (None, reason) instead of failing when no host can take the job."""
+def probe(proj: dict, alias: str) -> tuple[dict | None, str | None]:
+    """(info, cold) of a project host. cold is the cloud state of an on-demand host that
+    must be started before it takes a job (stopped, stopping, booting), else None. The
+    cloud API is asked first, so a stopped host costs no ssh timeout."""
+    if not on_demand(proj, alias):
+        return host_info(alias), None
+    state = provider_state(alias)
+    if state.startswith("error"):  # cloud API unusable: treat it as an ordinary host
+        return host_info(alias), None
+    info = host_info(alias) if state == "RUNNING" else None
+    if info is not None and not (info.get("power") or {}).get("stopping"):
+        return info, None
+    return None, (state if info is None else "stopping")
+
+
+def place(proj: dict, res: dict, strict: bool = True,
+          start: bool = True) -> tuple[str | None, str, bool]:
+    """(host, reason, cold) for a new job across the project's hosts; cold = the host is a
+    stopped on-demand host that submit must start. strict=False (dry run) returns
+    (None, reason, False) instead of failing when no host can take the job. start=False
+    passes over stopped hosts."""
     device = res.get("device", "cpu")
     gpus = needs(res)[0]
     declared = {h["alias"]: set(h["devices"]) for h in proj["hosts"] if "devices" in h}
     skipped = [f"{a}: no {device}" for a, d in declared.items() if not can_run(device, d)]
     ask = [h["alias"] for h in proj["hosts"] if h["alias"] not in declared or can_run(device, declared[h["alias"]])]
-    capable = []
-    for alias, info in host_infos(ask).items():
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(ask))) as ex:
+        probed = dict(zip(ask, ex.map(lambda al: probe(proj, al), ask)))
+    capable, cold = [], {}
+    for alias, (info, state) in probed.items():
         total_gpus = info.get("slots", {}).get("gpu", 0) if info else 0
-        if info is None:
+        if state is not None:  # on-demand, devices declared; the GPU count is checked after the start
+            if start:
+                capable.append((alias, None))
+                cold[alias] = state
+            else:
+                skipped.append(f"{alias}: {state.lower()} (--no-start)")
+        elif info is None:
             skipped.append(f"{alias}: unreachable")
         elif not can_run(device, declared.get(alias) or info_devices(info)):
             skipped.append(f"{alias}: no {device}")
@@ -329,32 +372,36 @@ def place(proj: dict, res: dict, strict: bool = True) -> tuple[str | None, str]:
     note = f" (skipped {'; '.join(skipped)})" if skipped else ""
     if not capable:
         if not strict:
-            return None, f"no project host can run this job now{note}"
+            return None, f"no project host can run this job now{note}", False
         die(f"no project host can run device={device} with gpus={gpus}{note}")
-    for alias, info in capable:
+    warm = [(al, info) for al, info in capable if al not in cold]
+    for alias, info in warm:
         if fits_now(info, res):
-            return alias, f"fits now, free {info['free']}{note}"
-    for alias, info in capable:  # old runner: idle means it fits
+            return alias, f"fits now, free {info['free']}{note}", False
+    for alias, info in warm:  # old runner: idle means it fits
         if fits_now(info, res) is None and not info.get("running") and not info.get("queued"):
-            return alias, f"idle{note}"
-    alias, info = min(capable, key=lambda x: len(x[1].get("queued", [])) + len(x[1].get("running", [])))
-    return alias, f"no host has room now; shortest queue ({len(info.get('queued', []))} queued){note}"
+            return alias, f"idle{note}", False
+    for alias in cold:  # in project order: a started host is empty, so the job runs at once
+        return alias, f"{cold[alias].lower()}; no running host has room now, starting it{note}", True
+    alias, info = min(warm, key=lambda x: len(x[1].get("queued", [])) + len(x[1].get("running", [])))
+    return alias, f"no host has room now; shortest queue ({len(info.get('queued', []))} queued){note}", False
 
 
-def choose_host(a, spec: dict, proj: dict) -> tuple[str | None, str]:
+def choose_host(a, spec: dict, proj: dict) -> tuple[str | None, str, bool]:
+    """(host, reason, cold): cold = placement picked a stopped on-demand host."""
     if a.host:
-        return a.host, "--host"
+        return a.host, "--host", False
     if os.environ.get("RJOB_HOST"):
-        return os.environ["RJOB_HOST"], "$RJOB_HOST"
+        return os.environ["RJOB_HOST"], "$RJOB_HOST", False
     if spec.get("host"):
-        return spec["host"], "job.toml host"
+        return spec["host"], "job.toml host", False
     hosts = project_hosts(proj)
     if len(hosts) == 1:
         why = too_long(proj["hosts"][0], spec.get("resources", {}))
-        return hosts[0], "only project host" + (f" ({why}, no other host)" if why else "")
+        return hosts[0], "only project host" + (f" ({why}, no other host)" if why else ""), False
     if hosts:
-        return place(proj, spec.get("resources", {}), strict=not a.dry_run)
-    return "mac", "default (no project file)"
+        return place(proj, spec.get("resources", {}), strict=not a.dry_run, start=not a.no_start)
+    return "mac", "default (no project file)", False
 
 
 def job_host(a) -> str:
@@ -428,7 +475,7 @@ def cmd_submit(a) -> None:
         spec_path = spec_path / "job.toml"
     spec = tomllib.loads(spec_path.read_text())
     proj = load_project(a.project, spec_path.parent, spec)
-    host, why = choose_host(a, spec, proj)
+    host, why, cold = choose_host(a, spec, proj)
     print(f"host: {host or 'none'} ({why})", file=sys.stderr)
     entry, res = host_entry(proj, host), spec.get("resources", {})
     if host and why.startswith(("--host", "$RJOB_HOST", "job.toml host")) and (limit := too_long(entry, res)):
@@ -436,6 +483,13 @@ def cmd_submit(a) -> None:
     rate = float(entry.get("cost_per_hour", 0))
     if host and rate:
         print(f"cost: <= {rate * job_hours(res):.2f} ({rate:g}/h x timeout_hours {job_hours(res):g})", file=sys.stderr)
+    managed = bool(host) and on_demand(proj, host)
+    if managed and not a.dry_run and (cold or not a.no_start):
+        power_start(host, rate, True, START_TIMEOUT)  # returns at once for a running host
+        if cold and (why_not := unfit_after_start(host, res)):
+            die(f"{host} was started but cannot run this job: {why_not}; it stops itself when idle")
+    elif cold:
+        print(f"dry run: submit would start {host}", file=sys.stderr)
     job, base = resolve_job(spec_path, spec, proj, host, a.dry_run)
     if a.dry_run:
         print(json.dumps(job, indent=2))
@@ -450,13 +504,35 @@ def cmd_submit(a) -> None:
             if not (base / f).is_file():
                 die(f"run.files entry {f} not found next to {spec_path}")
             tar.add(base / f, arcname=f, recursive=False)
-    job_id = remote(host, ["submit"], stdin=buf.getvalue()).decode().strip()
+    job_id = submit_payload(host, buf.getvalue(), managed, rate)
     STATE.mkdir(parents=True, exist_ok=True)
     with open(STATE / "jobs.jsonl", "a") as fh:
         fh.write(json.dumps({"id": job_id, "host": host, "submitted": time.strftime("%Y-%m-%dT%H:%M:%S"),
                              "spec": str(spec_path.resolve()), "cost_per_hour": rate,
                              "job": job}) + "\n")
     print(job_id)
+
+
+def unfit_after_start(host: str, res: dict) -> str | None:
+    """Why a just-started host cannot run the job (only its GPU count was unknown while stopped)."""
+    info = host_info(host) or {}
+    total, gpus = info.get("slots", {}).get("gpu", 0), needs(res)[0]
+    if gpus > total and not (res.get("device") == "auto" and total == 0):
+        return f"only {total} GPUs"
+    return None
+
+
+def submit_payload(host: str, payload: bytes, managed: bool, rate: float) -> str:
+    """Queue the job; an on-demand host that began to stop after it was checked refuses
+    with "host is stopping": wait for the stop, start it again and resubmit once."""
+    p = subprocess.run(ssh_cmd(host, ["submit"]), input=payload, capture_output=True)
+    if p.returncode != 0 and managed and b"host is stopping" in p.stderr:
+        print(f"{host} began to stop; starting it again", file=sys.stderr)
+        power_start(host, rate, True, START_TIMEOUT)
+        p = subprocess.run(ssh_cmd(host, ["submit"]), input=payload, capture_output=True)
+    if p.returncode != 0:
+        remote_failed(host, ["submit"], p)
+    return p.stdout.decode().strip()
 
 
 def local_record(job_id: str) -> dict:
@@ -498,6 +574,11 @@ def fetch_stream(host: str, job_id: str, paths: list[str], out: Path) -> None:
 def cmd_fetch(a) -> None:
     host = job_host(a)
     rec = local_record(a.id)
+    if a.start:
+        proj = load_project(a.project)
+        if host not in power_hosts():
+            die(f"--start: {host} is not in {POWER_CONFIG}")
+        power_start(host, float(host_entry(proj, host).get("cost_per_hour", 0)), True, START_TIMEOUT)
     dest = Path(a.dest) if a.dest else Path(rec.get("job", {}).get("runs_dir", DEFAULT_RUNS)) / a.id
     out = dest / "outputs"
     out.mkdir(parents=True, exist_ok=True)
@@ -664,17 +745,30 @@ def power_status_row(alias: str, rate: float) -> str:
         decision = "runner not answering yet"
     elif info and not pw:
         decision = "runner without autostop"
+    elif auto and before(auto.get("checked"), pw.get("booted")):  # the watchdog's last word predates this boot
+        decision, auto = f"no check since boot at {pw['booted']}", {}
     else:
         decision = auto.get("decision") or ("stopping" if pw.get("stopping") else "-")
     return (f"{alias}\t{state}\t{rate:g}\t{jobs}\t{decision}\t{pw.get('hold_until') or '-'}"
             f"\t{auto.get('stop_at') or '-'}\t{'yes' if pw.get('stop_requested') else '-'}")
 
 
+def before(t1: str | None, t2: str | None) -> bool:
+    """t1 < t2 for two runner timestamps (%Y-%m-%dT%H:%M:%S%z); False if either is missing or odd."""
+    try:
+        f = "%Y-%m-%dT%H:%M:%S%z"
+        return datetime.datetime.strptime(t1, f) < datetime.datetime.strptime(t2, f)
+    except (TypeError, ValueError):
+        return False
+
+
 def power_start(alias: str, rate: float, wait: bool, timeout: float) -> None:
-    """Start a stopped host (idempotent; one starter per alias), then wait for its runner."""
+    """Start a stopped host (idempotent; one starter per alias), then wait for its runner.
+    A host that is stopping (cloud STOPPING, or RUNNING with the runner's stopping marker,
+    set by autostop just before its API call) is started again once the stop has finished."""
     mod, cfg = power_provider(alias)
     STATE.mkdir(parents=True, exist_ok=True)
-    t0 = time.time()
+    t0, acted = time.time(), False
     with open(STATE / f"power-{alias}.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         while True:
@@ -688,25 +782,37 @@ def power_start(alias: str, rate: float, wait: bool, timeout: float) -> None:
                     mod.start(cfg)
                 except Exception as exc:
                     die(f"{alias}: start failed: {exc}")
+                acted = True
                 break
-            if state in ("RUNNING", "STARTING"):
+            stopping = state == "STOPPING"
+            if state == "RUNNING":
+                info = host_info(alias)
+                stopping = bool(info and (info.get("power") or {}).get("stopping"))
+                if not stopping:
+                    break
+            elif state == "STARTING":
+                acted = True
                 break
-            if state != "STOPPING" or time.time() - t0 > timeout:
-                die(f"{alias}: cloud state {state}; not starting it")
-            time.sleep(10)  # a stop in progress: start once it has finished
+            if not stopping or time.time() - t0 > timeout:
+                die(f"{alias}: cloud state {state}{' (stopping)' if stopping else ''}; not starting it")
+            if not acted:
+                print(f"{alias} is stopping; starting it again once it has stopped", file=sys.stderr)
+                acted = True
+            time.sleep(POWER_POLL)
     if not wait:
         return
     while True:  # ready = the runner answers and the boot unit has cleared the stopping marker
         info = host_info(alias)
         if info is not None and not (info.get("power") or {}).get("stopping"):
             break
+        acted = True
         left = timeout - (time.time() - t0)
         if left <= 0:
             why = ("its runner still marks it stopping: check rjob-boot.service on the host" if info
                    else "its runner does not answer")
             die(f"{alias} not ready {timeout:.0f} s after the start: {why}; rjob power status {alias}")
-        time.sleep(min(10, max(1, left)))
-    print(f"{alias} is up ({time.time() - t0:.0f} s)", file=sys.stderr)
+        time.sleep(min(POWER_POLL, max(1, left)))
+    print(f"{alias} is up ({time.time() - t0:.0f} s)" if acted else f"{alias} is running", file=sys.stderr)
 
 
 def cmd_power(a) -> None:
@@ -757,6 +863,7 @@ def main() -> None:
     real_add = sp.add_parser
     sp.add_parser = lambda name, **kw: real_add(name, parents=[common], **kw)
     p = sp.add_parser("submit"); p.add_argument("spec"); p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-start", action="store_true", help="never start a stopped on-demand host")
     p.set_defaults(fn=cmd_submit)
     for name in ("status", "cancel", "provenance", "manifest"):
         p = sp.add_parser(name); p.add_argument("id"); p.set_defaults(fn=passthrough([name, "$id"], by_id=True))
@@ -777,7 +884,9 @@ def main() -> None:
     p = sp.add_parser("wait"); p.add_argument("id"); p.add_argument("--interval", type=float, default=60)
     p.set_defaults(fn=cmd_wait)
     p = sp.add_parser("fetch"); p.add_argument("id"); p.add_argument("--dest")
-    p.add_argument("--include", action="append"); p.set_defaults(fn=cmd_fetch)
+    p.add_argument("--include", action="append")
+    p.add_argument("--start", action="store_true", help="start the job's host first if it is a stopped cloud host")
+    p.set_defaults(fn=cmd_fetch)
     p = sp.add_parser("push"); p.add_argument("path"); p.add_argument("rev", nargs="?", default="HEAD")
     p.set_defaults(fn=lambda a: push_commit(default_host(a), Path(a.path), repo_name(Path(a.path)),
                                             git(Path(a.path), "rev-parse", a.rev)))

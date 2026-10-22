@@ -176,6 +176,24 @@ def mtime(path: Path) -> float:
         return 0.0
 
 
+def os_boot_time() -> float:
+    """When this machine booted (Linux /proc/stat btime); 0 where unknown (macOS has no autostop)."""
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except OSError:
+        pass
+    return 0.0
+
+
+def stopping() -> bool:
+    """The autostop watchdog is stopping this host. A marker from before the current boot is
+    stale (the stop happened; rjob-boot.service clears it) and does not count."""
+    t = mtime(POWER / "stopping")
+    return t > 0 and t >= os_boot_time()
+
+
 def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -746,7 +764,7 @@ def cmd_submit() -> None:
         shutil.rmtree(d, ignore_errors=True)
         raise
     with flock("scheduler"):  # the autostop check holds it too: a job is queued before or refused after
-        if (POWER / "stopping").exists():
+        if stopping():
             shutil.rmtree(d, ignore_errors=True)
             raise UserError("host is stopping; start it again, then resubmit")
         write_json(d / "job.json", job)
@@ -885,8 +903,9 @@ def cmd_info(mode: str = "") -> None:
 def power_info() -> dict:
     """Autostop state for `info`: the runner's own flags plus the watchdog's last decision (if installed)."""
     hold = read_json(POWER / "hold", {}).get("until", 0)
-    return {"stopping": (POWER / "stopping").exists(), "stop_requested": (POWER / "stop_requested").exists(),
-            "hold_until": iso(hold) if hold > time.time() else None,
+    booted = mtime(POWER / "booted")
+    return {"stopping": stopping(), "stop_requested": (POWER / "stop_requested").exists(),
+            "hold_until": iso(hold) if hold > time.time() else None, "booted": iso(booted) if booted else None,
             "autostop": read_json(AUTOSTOP_STATUS) if AUTOSTOP_STATUS.is_file() else None}
 
 
