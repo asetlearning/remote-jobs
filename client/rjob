@@ -6,7 +6,8 @@
     rjob status ID | logs ID [N] | cancel ID | provenance ID
     rjob wait ID [--interval S]                    block until the job is finished; exit 0 iff done
     rjob fetch ID [--dest DIR] [--include GLOB]... resumable download of the job's outputs
-    rjob hosts                                     capacity and load of every host of the project
+    rjob hosts                                     capacity, load, cost and hour limit of every project host
+    rjob cost [--since YYYY-MM-DD] [--host H]      hours and cost of recorded jobs, per job and per host
     rjob list [--all] | info                       jobs / info of one host (--all: every project host)
     rjob push REPO_PATH [REV]                      ship a commit (normally done by submit)
     rjob put-data FILE                             upload a large input once; prints sha256:...
@@ -15,10 +16,13 @@
 Hosts are ~/.ssh/config aliases whose key is locked to run-job.
 Project: --project, else $RJOB_PROJECT, else `project = ...` in job.toml, else the
 nearest rjob.toml above job.toml (or above the current directory). It lists the
-project's hosts in order of preference and its default runs_dir.
+project's hosts in order of preference and its default runs_dir. A host entry may
+set cost_per_hour (default 0 = free) and max_hours (longest timeout_hours it should
+take; a longer job goes there only when no other capable host is reachable).
 Host of a new job: --host, else $RJOB_HOST, else `host = ...` in job.toml, else
-placed on the first project host that can run its device and has room now, else
-on the capable host with the shortest queue; without a project: "mac".
+placed on the first project host that can run its device and has room now, else on
+the capable host with the shortest queue, passing over hosts whose max_hours is below
+the job's timeout_hours while another capable host exists; without a project: "mac".
 Commands on a job id use the host recorded at submit; --host overrides. A job
 missing from the record: $RJOB_HOST, else the project host that knows the id,
 else "mac".
@@ -32,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime
 import fnmatch
 import hashlib
 import io
@@ -52,6 +57,7 @@ BATCH_BYTES = 256 << 20   # resume granularity; the transfer itself is streamed
 TERMINAL = {"done", "failed", "cancelled", "timeout", "dead"}
 GPU_DEVICES = ("mps", "cuda", "gpu", "auto")
 PROJECT_FILE = "rjob.toml"
+DEFAULT_TIMEOUT_HOURS = 24  # the host runner's default for resources.timeout_hours
 
 
 def die(msg: str, code: int = 2):
@@ -177,7 +183,29 @@ def load_project(explicit: str | None, start: Path | None = None, spec: dict | N
     for h in proj.get("hosts", []):
         if "alias" not in h:
             die(f"{path}: every [[hosts]] entry needs an alias")
+        for key, low in (("cost_per_hour", 0), ("max_hours", None)):
+            v = h.get(key)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))
+                                  or (v < low if low is not None else v <= 0)):
+                die(f"{path}: host {h['alias']}: {key} must be a number {'>= 0' if low is not None else '> 0'}")
     return proj
+
+
+def host_entry(proj: dict, alias: str) -> dict:
+    """The project's [[hosts]] entry for alias, or {} (a host outside the list has no cost and no limit)."""
+    return next((h for h in proj.get("hosts", []) if h["alias"] == alias), {})
+
+
+def job_hours(res: dict) -> float:
+    return float(res.get("timeout_hours", DEFAULT_TIMEOUT_HOURS))
+
+
+def too_long(entry: dict, res: dict) -> str | None:
+    """Why the host would rather not take a job this long, or None."""
+    limit = entry.get("max_hours")
+    if limit is not None and job_hours(res) > limit:
+        return f"max_hours {limit:g} < timeout_hours {job_hours(res):g}"
+    return None
 
 
 def project_hosts(proj: dict) -> list[str]:
@@ -267,6 +295,13 @@ def place(proj: dict, res: dict, strict: bool = True) -> tuple[str | None, str]:
             skipped.append(f"{alias}: only {total_gpus} GPUs")
         else:
             capable.append((alias, info))
+    # max_hours is a preference: a host is passed over for a longer job only while another capable host exists
+    longer = {al: why for al, _ in capable if (why := too_long(host_entry(proj, al), res))}
+    if len(longer) < len(capable):
+        skipped += [f"{al}: {why}" for al, why in longer.items()]
+        capable = [(al, info) for al, info in capable if al not in longer]
+    elif capable:
+        skipped.append(f"no capable host within max_hours ({'; '.join(f'{al}: {w}' for al, w in longer.items())}), using it anyway")
     note = f" (skipped {'; '.join(skipped)})" if skipped else ""
     if not capable:
         if not strict:
@@ -291,7 +326,8 @@ def choose_host(a, spec: dict, proj: dict) -> tuple[str | None, str]:
         return spec["host"], "job.toml host"
     hosts = project_hosts(proj)
     if len(hosts) == 1:
-        return hosts[0], "only project host"
+        why = too_long(proj["hosts"][0], spec.get("resources", {}))
+        return hosts[0], "only project host" + (f" ({why}, no other host)" if why else "")
     if hosts:
         return place(proj, spec.get("resources", {}), strict=not a.dry_run)
     return "mac", "default (no project file)"
@@ -370,6 +406,12 @@ def cmd_submit(a) -> None:
     proj = load_project(a.project, spec_path.parent, spec)
     host, why = choose_host(a, spec, proj)
     print(f"host: {host or 'none'} ({why})", file=sys.stderr)
+    entry, res = host_entry(proj, host), spec.get("resources", {})
+    if host and why.startswith(("--host", "$RJOB_HOST", "job.toml host")) and (limit := too_long(entry, res)):
+        print(f"warning: {host} is pinned although {limit}", file=sys.stderr)
+    rate = float(entry.get("cost_per_hour", 0))
+    if host and rate:
+        print(f"cost: <= {rate * job_hours(res):.2f} ({rate:g}/h x timeout_hours {job_hours(res):g})", file=sys.stderr)
     job, base = resolve_job(spec_path, spec, proj, host, a.dry_run)
     if a.dry_run:
         print(json.dumps(job, indent=2))
@@ -388,7 +430,8 @@ def cmd_submit(a) -> None:
     STATE.mkdir(parents=True, exist_ok=True)
     with open(STATE / "jobs.jsonl", "a") as fh:
         fh.write(json.dumps({"id": job_id, "host": host, "submitted": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                             "spec": str(spec_path.resolve()), "job": job}) + "\n")
+                             "spec": str(spec_path.resolve()), "cost_per_hour": rate,
+                             "job": job}) + "\n")
     print(job_id)
 
 
@@ -488,10 +531,13 @@ def all_hosts(a) -> list[str]:
 
 
 def cmd_hosts(a) -> None:
-    print("host\tdevices\tgpu free/total\tcpu free/total\tmem_gb free/total\trunning\tqueued")
+    proj = load_project(a.project)
+    print("host\tdevices\tgpu free/total\tcpu free/total\tmem_gb free/total\trunning\tqueued\tcost/h\tmax_hours")
     for host, info in host_infos(all_hosts(a)).items():
+        entry = host_entry(proj, host)
+        terms = f"\t{entry.get('cost_per_hour', 0):g}\t{entry.get('max_hours', '-')}"
         if info is None:
-            print(f"{host}\tunreachable")
+            print(f"{host}\tunreachable{chr(9) * 6}{terms}")
             continue
         slots, free = info.get("slots", {}), info.get("free") or {}
         def pair(k):
@@ -499,7 +545,52 @@ def cmd_hosts(a) -> None:
             f = round(f, 1) if isinstance(f, float) else f
             return f"{f}/{t if t is not None else '-'}"
         print(f"{host}\t{','.join(sorted(info_devices(info)))}\t{pair('gpu')}\t{pair('cpu')}\t{pair('mem_gb')}"
-              f"\t{len(info.get('running', []))}\t{len(info.get('queued', []))}")
+              f"\t{len(info.get('running', []))}\t{len(info.get('queued', []))}{terms}")
+
+
+def busy_hours(st: dict) -> float | None:
+    """Hours the job held its host: from start (build included) to finish, or to now while it runs."""
+    if not st.get("started"):
+        return None
+    try:
+        t0 = datetime.datetime.strptime(st["started"], "%Y-%m-%dT%H:%M:%S%z")
+        t1 = (datetime.datetime.strptime(st["finished"], "%Y-%m-%dT%H:%M:%S%z") if st.get("finished")
+              else datetime.datetime.now(datetime.timezone.utc))
+    except (TypeError, ValueError):  # a runner with another timestamp format: unpriced, not fatal
+        return None
+    return (t1 - t0).total_seconds() / 3600
+
+
+def cmd_cost(a) -> None:
+    """Hours and cost of the recorded jobs, at the cost_per_hour each job was submitted with."""
+    path = STATE / "jobs.jsonl"
+    recs = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    recs = [r for r in recs if (not a.since or r["submitted"] >= a.since) and (not a.host or r["host"] == a.host)]
+
+    def status(r):
+        p = subprocess.run(ssh_cmd(r["host"], ["status", r["id"]]), stdin=subprocess.DEVNULL, capture_output=True)
+        try:
+            return json.loads(p.stdout) if p.returncode == 0 else None
+        except json.JSONDecodeError:
+            return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        sts = list(ex.map(status, recs))
+    print("id\thost\tname\tstate\thours\tcost/h\tcost")
+    totals: dict[str, list[float]] = {}
+    for r, st in zip(recs, sts):
+        rate = float(r.get("cost_per_hour", 0))
+        hours = busy_hours(st) if st else None
+        state = st["state"] if st else "unknown"
+        cost = rate * hours if hours is not None else None
+        print(f"{r['id']}\t{r['host']}\t{r['job']['name']}\t{state}\t"
+              f"{'-' if hours is None else f'{hours:.2f}'}\t{rate:g}\t{'-' if cost is None else f'{cost:.2f}'}")
+        t = totals.setdefault(r["host"], [0.0, 0.0])
+        t[0] += hours or 0
+        t[1] += cost or 0
+    for host, (hours, cost) in totals.items():
+        print(f"total\t{host}\t\t\t{hours:.2f}\t\t{cost:.2f}")
+    if totals:
+        print(f"total\tall\t\t\t{sum(t[0] for t in totals.values()):.2f}\t\t{sum(t[1] for t in totals.values()):.2f}")
 
 
 def cmd_list(a) -> None:
@@ -539,6 +630,8 @@ def main() -> None:
     sp.add_parser("info").set_defaults(fn=passthrough(["info"]))
     p = sp.add_parser("list"); p.add_argument("--all", action="store_true"); p.set_defaults(fn=cmd_list)
     sp.add_parser("hosts").set_defaults(fn=cmd_hosts)
+    p = sp.add_parser("cost"); p.add_argument("--since", help="only jobs submitted on or after YYYY-MM-DD")
+    p.set_defaults(fn=cmd_cost)
     p = sp.add_parser("wait"); p.add_argument("id"); p.add_argument("--interval", type=float, default=60)
     p.set_defaults(fn=cmd_wait)
     p = sp.add_parser("fetch"); p.add_argument("id"); p.add_argument("--dest")

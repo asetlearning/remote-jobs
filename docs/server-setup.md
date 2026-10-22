@@ -34,6 +34,13 @@ This adds a Linux server (x86_64, NVIDIA GPUs or CPU only) as a remote-jobs host
    ```
    - `from=` must be the address the **server** sees the VM connect from (check `echo $SSH_CLIENT` in an ordinary login from the VM, or the server's auth log). The Mac's `10.211.55.*` is the Parallels network and is wrong here. Omit `from=` if that address is not stable; the forced command is still the boundary.
    - If sshd uses `AllowUsers`/`AllowGroups`, an admin must add gpuworker.
+   - **Tailscale SSH bypasses this line.** On a server reached over Tailscale (or headscale) with Tailscale SSH on (`tailscale up --ssh`, `RunSSH: true`), `tailscaled` answers port 22 on the tailnet address and logs users in by tailnet identity: sshd and `authorized_keys` are never consulted, so the worker key gets a full shell and every `rjob` verb runs as a shell command (`rjob info` then prints the GNU `info` manual). Before turning it off (admin):
+     - give every admin account its own key in its `~/.ssh/authorized_keys`, and test it (`ssh -i <key> <you>@127.0.0.1` on the server); password login is usually off, so without a key you are locked out;
+     - check that sshd listens on all addresses (`ss -tln | grep ':22'`; on Ubuntu 24.04 `ssh.socket` starts sshd on demand);
+     - keep a session open, run `sudo tailscale set --ssh=false`, and log in again from your laptop (`sudo tailscale set --ssh=true` from the open session or the provider's console undoes it);
+     - the tailnet keeps working; only who answers port 22 changes. The headscale/Tailscale ACL must still allow TCP 22 from the VM's side.
+
+     With Tailscale, `from=` is the address the server sees: the tailnet address of the machine the VM routes through (for a Parallels VM without its own Tailscale, the Mac's `100.x` address).
 5. **Slots (optional).** Edit `~/rjob/config.toml`: `gpu_ids` (a subset reserves GPUs for other users), `cpu_slots`, `mem_gb`.
 
 ## VM
@@ -54,7 +61,7 @@ rjob --project <project dir> hosts             # every project host, with free c
 rjob submit examples/smoke-device-cuda         # placed on the CUDA host; result says device=cuda
 ```
 
-**The lock must hold.** Each of these must fail or print only the usage line:
+**The lock must hold.** Each of these must fail or print only the usage line (if they succeed on a Tailscale host, see step 4):
 ```bash
 ssh gpuserver
 ssh gpuserver ls /home

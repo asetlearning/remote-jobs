@@ -29,7 +29,8 @@ rjob logs <id> 50
 rjob wait <id> --interval 60             # exits 0 iff the job finished with state "done"
 rjob fetch <id> [--include '*.json']     # → <runs_dir>/<id>/; re-run to resume or verify
 rjob list [--all] | rjob info | rjob cancel <id>
-rjob hosts                               # capacity and load of every host of the project
+rjob hosts                               # capacity, load, cost/h and max_hours of every project host
+rjob cost [--since YYYY-MM-DD] [--host H]  # hours and cost of recorded jobs, per job and per host
 rjob put-data big_input.json             # upload once per host (content-addressed); submit uploads [data] to the placed host itself
 rjob cleanup job <id> | rjob cleanup builds 30
 ```
@@ -58,13 +59,17 @@ runs_dir = "runs"                       # project default, relative to this file
 [[hosts]]                               # order = preference
 alias = "mac"
 devices = ["cpu", "mps"]                # optional; otherwise learned from `rjob info`
+max_hours = 2                           # optional: longest timeout_hours this host should take
 [[hosts]]
 alias = "gpuserver"
 devices = ["cpu", "cuda"]
+cost_per_hour = 2.5                     # optional: price of one host hour, default 0 (free)
 ```
 
 - **Finding the project file:** `--project <dir|file>`, else `$RJOB_PROJECT`, else `project = "..."` in job.toml, else the nearest `rjob.toml` above job.toml (for other commands: above the current directory).
 - **Placing a new job:** `--host`, else `$RJOB_HOST`, else `host = "..."` in job.toml, else the first project host that can run the job's device, has enough GPUs in total and has room now (free GPU ids, CPU slots and memory, empty queue), else the capable host with the shortest queue. Hosts are queried in parallel with a light `info brief`; unreachable ones are skipped. `submit` prints `host: <alias> (<reason>)` on stderr; `--dry-run` places without submitting and reports `host: none` instead of failing when no host can take the job.
+- **Hour limits:** a job counts as `resources.timeout_hours` long (default 24, the host's default). `max_hours` is a preference, not a refusal: placement passes over a host whose `max_hours` is smaller while another capable host is reachable (even a busy one, which then queues the job), and says so in the reason. When no other capable host exists or answers (no other GPU host, the only project host, the others down), the limited host takes the job and the reason says so. The project's host list may change at any time; the rule is evaluated per submit. A pinned host (`--host`, `$RJOB_HOST`, `host = ...`) takes the job with a warning.
+- **Costs:** `cost_per_hour` (default 0) is the price of one hour on the host. `submit` prints `cost: <= X` (rate × `timeout_hours`, an upper bound) for paid hosts, and the local record keeps the rate. `rjob cost` prices each recorded job by the hours it held its host (start, build included, to finish; to now while running) and sums per host. Each job is charged the full host rate, so concurrent jobs on one host overstate the bill; the hosts' own invoices are the real cost.
 - **Without a project file** a new job goes, as before, to `--host`, else `$RJOB_HOST`, else `mac`.
 - **Commands on a job id** (`status`, `logs`, `wait`, `fetch`, `cancel`, `provenance`, `manifest`, `cleanup job`) use the host recorded at submit in `~/.local/state/rjob/jobs.jsonl`; `--host` overrides. A job missing from the record goes to `$RJOB_HOST`, else the project host that knows its id, else `mac` (as before multi-host).
 - `--host` and `--project` may come before or after the command.

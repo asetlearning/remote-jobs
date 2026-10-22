@@ -8,10 +8,18 @@ runs_dir = "runs"          # default for this project's jobs; relative to this f
 # Hosts in order of preference. A new job goes to the first host that can run its
 # device and has room now; if none has room, to the capable host with the shortest
 # queue. `host = "..."` in job.toml or `rjob --host` overrides placement.
+#
+# Optional per host:
+#   cost_per_hour  price of one hour on the host, default 0 (free). `submit` prints the
+#                  bound cost_per_hour x timeout_hours; `rjob cost` sums actual hours.
+#   max_hours      longest timeout_hours the host should take; default: no limit. A longer
+#                  job goes elsewhere while another capable host is reachable, else here.
 [[hosts]]
 alias = "mac"              # ~/.ssh/config alias, key locked to run-job
 devices = ["cpu", "mps"]   # optional; otherwise learned from `rjob info`
+max_hours = 2              # longer jobs go to the servers; here only when no other host can run them
 
 [[hosts]]
 alias = "gpuserver"
 devices = ["cpu", "cuda"]
+cost_per_hour = 2.5        # e.g. a rented cloud GPU server
