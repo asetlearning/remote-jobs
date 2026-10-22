@@ -561,7 +561,10 @@ def cmd_hosts(a) -> None:
         entry = host_entry(proj, host)
         terms = f"\t{entry.get('cost_per_hour', 0):g}\t{entry.get('max_hours', '-')}"
         if info is None:
-            print(f"{host}\tunreachable{chr(9) * 6}{terms}")
+            state = "unreachable"
+            if host in power_hosts(quiet=True):  # a cloud host: say whether it is just stopped
+                state = f"{provider_state(host).lower()} (rjob power start {host})"
+            print(f"{host}\t{state}{chr(9) * 6}{terms}")
             continue
         slots, free = info.get("slots", {}), info.get("free") or {}
         def pair(k):
@@ -693,10 +696,16 @@ def power_start(alias: str, rate: float, wait: bool, timeout: float) -> None:
             time.sleep(10)  # a stop in progress: start once it has finished
     if not wait:
         return
-    while host_info(alias) is None:
-        if time.time() - t0 > timeout:
-            die(f"{alias} did not answer within {timeout:.0f} s after the start; rjob power status {alias}")
-        time.sleep(10)
+    while True:  # ready = the runner answers and the boot unit has cleared the stopping marker
+        info = host_info(alias)
+        if info is not None and not (info.get("power") or {}).get("stopping"):
+            break
+        left = timeout - (time.time() - t0)
+        if left <= 0:
+            why = ("its runner still marks it stopping: check rjob-boot.service on the host" if info
+                   else "its runner does not answer")
+            die(f"{alias} not ready {timeout:.0f} s after the start: {why}; rjob power status {alias}")
+        time.sleep(min(10, max(1, left)))
     print(f"{alias} is up ({time.time() - t0:.0f} s)", file=sys.stderr)
 
 

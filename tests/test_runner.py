@@ -576,12 +576,20 @@ def rjob_power():
           "a command on a stopped cloud host says how to start it")
     rw = row()
     check(rw[1:4] == ["STOPPED", "0.55", "-"], f"power status of a stopped host {rw}")
+    r = sh(*bare, "hosts", env=env, check_rc=False)
+    check("pw\tstopped (rjob power start pw)" in r.stdout, f"rjob hosts shows a stopped cloud host as stopped {r.stdout!r}")
+    r = rp("start", "pw", "--timeout", "2")
+    check(r.returncode != 0 and "still marks it stopping" in r.stderr,
+          "power start waits until the boot unit cleared the stopping marker")
+    st = json.loads(fake_state.read_text())
+    fake_state.write_text(json.dumps({**st, "state": "STOPPED"}))
+    (home / "rjob/power/stopping").unlink()
     r = rp("start", "pw")
     check(r.returncode == 0 and "starting pw (0.55/h)" in r.stderr and "pw is up" in r.stderr and not down.exists(),
           f"power start starts and waits for the runner {r.stderr[-200:]}")
     sh(sys.executable, str(home / "rjob/bin/run_job.py"), "_power-boot", env=dict(os.environ, RJOB_ROOT=str(home / "rjob")))
     r = rp("start", "pw")
-    check(r.returncode == 0 and calls() == ["stop", "start"] and "starting" not in r.stderr,
+    check(r.returncode == 0 and calls() == ["stop", "start", "start"] and "starting" not in r.stderr,
           "power start on a running host does nothing")
     r = rp("start", "nohost")
     check(r.returncode != 0 and "not in" in r.stderr, "power start only for hosts in power.toml")
