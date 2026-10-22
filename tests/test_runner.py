@@ -56,7 +56,7 @@ def setup_host(home=HOSTHOME, extra="", runner=None):
     (home / "rjob/config.toml").write_text(base + extra)
     fake = TMP / "fakessh"
     fake.write_text(f'#!/bin/bash\n# fake ssh: $1 = host alias, $2 = command string\n'
-                    f'H="{TMP}/home-$1"\n[ -x "$H/rjob/bin/run-job" ] || {{ echo "ssh: unreachable $1" >&2; exit 255; }}\n'
+                    f'H="{TMP}/home-$1"\n[ -x "$H/rjob/bin/run-job" ] && [ ! -e "$H/DOWN" ] || {{ echo "ssh: unreachable $1" >&2; exit 255; }}\n'
                     f'SSH_ORIGINAL_COMMAND="$2" HOME="$H" exec "$H/rjob/bin/run-job"\n')
     fake.chmod(0o755)
     os.environ["RJOB_SSH"] = str(fake)
@@ -521,6 +521,82 @@ def autostop():
     check(not bad, f"internal power verbs and bad arguments rejected over ssh {bad}")
 
 
+def rjob_power():
+    """rjob power status|start|stop|hold against the autostop test host `pw` and the fake provider."""
+    import getpass
+    home = TMP / "home-pw"
+    fake_state = TMP / "pw-fake.json"
+    down = home / "DOWN"
+    fake_state.write_text(json.dumps({"state": "RUNNING", "calls": []}))
+    cfg = TMP / "autostop-power.toml"
+    cfg.write_text(f'worker = "{getpass.getuser()}"\nrunner_python = "{sys.executable}"\n'
+                   f'runner = "{home}/rjob/bin/run_job.py"\nrjob_root = "{home}/rjob"\n'
+                   f'idle_minutes = 30\nlogins_cmd = ["true"]\nprovider = "fake"\n'
+                   f'[fake]\nstate_file = "{fake_state}"\ndown_marker = "{down}"\n')
+    pconf = TMP / "power.toml"
+    pconf.write_text(f'[hosts.pw]\nprovider = "fake"\n[hosts.pw.fake]\nstate_file = "{fake_state}"\ndown_marker = "{down}"\n')
+    proj = TMP / "pwproj"
+    proj.mkdir()
+    (proj / "rjob.toml").write_text('[[hosts]]\nalias = "pw"\ncost_per_hour = 0.55\n')
+    env = dict(os.environ, RJOB_POWER_CONFIG=str(pconf))
+    bare = [sys.executable, str(REPO / "client/rjob"), "--project", str(proj)]
+
+    def rp(*args, check_rc=False):
+        return sh(*bare, "power", *args, env=env, check_rc=check_rc)
+
+    def wd():
+        return sh(sys.executable, str(REPO / "host/power/rjob-autostop"), check_rc=False,
+                  env=dict(os.environ, RJOB_AUTOSTOP_CONFIG=str(cfg)))
+
+    def calls():
+        return json.loads(fake_state.read_text())["calls"]
+
+    def row():
+        out = rp("status", "pw").stdout.splitlines()
+        return out[1].split("\t") if len(out) > 1 else []
+
+    pconf.chmod(0o644)
+    r = rp("status")
+    check(r.returncode != 0 and "chmod 600" in r.stderr, "power.toml readable by others is refused")
+    pconf.chmod(0o600)
+    rw = row()
+    check(rw[:4] == ["pw", "RUNNING", "0.55", "0/0"], f"power status: cloud state, cost, jobs {rw}")
+    r = rp("hold", "pw", "1")
+    check(r.returncode == 0 and "hold until" in r.stdout and row()[5] != "-", "power hold sets a hold shown in status")
+    rp("hold", "pw", "0", check_rc=True)
+    r = rp("stop", "pw")
+    check(r.returncode == 0 and "stop requested" in r.stdout and row()[7] == "yes", "power stop asks the host (request-stop)")
+    check(calls() == [], "the client never calls the provider's stop")
+    wd()
+    check(calls() == ["stop"] and down.exists(), "the host's watchdog does the stop")
+    jid = [json.loads(l)["id"] for l in (TMP / "state/jobs.jsonl").read_text().splitlines()
+           if json.loads(l)["host"] == "pw"][-1]
+    r = sh(*bare, "status", jid, env=env, check_rc=False)
+    check(r.returncode != 0 and "may be stopped: rjob power status pw" in r.stderr,
+          "a command on a stopped cloud host says how to start it")
+    rw = row()
+    check(rw[1:4] == ["STOPPED", "0.55", "-"], f"power status of a stopped host {rw}")
+    r = rp("start", "pw")
+    check(r.returncode == 0 and "starting pw (0.55/h)" in r.stderr and "pw is up" in r.stderr and not down.exists(),
+          f"power start starts and waits for the runner {r.stderr[-200:]}")
+    sh(sys.executable, str(home / "rjob/bin/run_job.py"), "_power-boot", env=dict(os.environ, RJOB_ROOT=str(home / "rjob")))
+    r = rp("start", "pw")
+    check(r.returncode == 0 and calls() == ["stop", "start"] and "starting" not in r.stderr,
+          "power start on a running host does nothing")
+    r = rp("start", "nohost")
+    check(r.returncode != 0 and "not in" in r.stderr, "power start only for hosts in power.toml")
+    st = json.loads(fake_state.read_text())
+    fake_state.write_text(json.dumps({**st, "state": "STOPPED"}))
+    r = rp("start", "pw", "--no-wait")
+    check(r.returncode == 0 and calls()[-1] == "start" and "is up" not in r.stderr, "power start --no-wait")
+    pconf.write_text(pconf.read_text() + "fail = true\n")
+    r = rp("status", "pw")
+    check(r.returncode == 0 and "error: fake provider failure" in r.stdout, "status reports a provider error")
+    pconf.write_text(f'[hosts.pw]\nprovider = "../etc"\n')
+    r = rp("start", "pw")
+    check(r.returncode != 0 and "must name a module" in r.stderr, "provider names are plain module names")
+
+
 def nebius_setup_scripts():
     """host/power/nebius-grant-power.sh (laptop) and nebius-setup-profile.sh (VM) against a stub CLI."""
     import getpass
@@ -612,6 +688,44 @@ esac
     src.write_text("{}")
     r = sh(*setup, env=dict(senv, STUB_STATE="STOPPED"), check_rc=False)
     check(r.returncode != 0 and "expected RUNNING" in r.stderr, "setup refuses when the VM state is not RUNNING")
+
+    # the agents' VM: grant --for vm, then vm/nebius-vm-setup.sh, then rjob power status through the nebius provider
+    for f in ("sa", "group", "member", "permit"):
+        (st / f).unlink(missing_ok=True)
+    vgrant = ["bash", str(REPO / "host/power/nebius-grant-power.sh"), "--tenant-id", "tenant-e00t",
+              "--project-id", "project-e00p", "--instance-id", "computeinstance-e00test", "--for", "vm", "--out", str(out)]
+    r = sh(*vgrant, env=env, check_rc=False)
+    vcred = out / "rjob-vm-power.json"
+    check(r.returncode == 0 and vcred.exists() and "vm/nebius-vm-setup.sh" in r.stdout
+          and any("--name rjob-vm-power" in l for l in log.read_text().splitlines()),
+          f"grant --for vm: one rjob-vm-power account, VM step printed {r.stderr[-200:]}")
+    n_keys = sum("auth-public-key generate" in l for l in log.read_text().splitlines())
+    r = sh(*vgrant, "--no-key", env=env, check_rc=False)
+    check(r.returncode == 0 and n_keys == sum("auth-public-key generate" in l for l in log.read_text().splitlines())
+          and "--alias <ssh-alias>" in r.stdout, "grant --no-key adds a permit without a new key")
+    (st / "profiles").unlink(missing_ok=True)
+    vdir = d / "vmconf"
+    vsetup = ["bash", str(REPO / "vm/nebius-vm-setup.sh"), "--alias", "nbvm", "--project-id", "project-e00p",
+              "--instance-id", "computeinstance-e00test", "--cli", str(stub)]
+    venv = dict(env, RJOB_POWER_DIR=str(vdir))
+    r = sh(*vsetup, env=venv, check_rc=False)
+    check(r.returncode != 0 and "pass --credentials" in r.stderr, "vm setup needs the key the first time")
+    r = sh(*vsetup, "--credentials", str(vcred), env=venv, check_rc=False)
+    ptoml = vdir / "power.toml"
+    check(r.returncode == 0 and not vcred.exists() and (vdir / "power/rjob-vm-power.json").exists()
+          and oct(ptoml.stat().st_mode & 0o777) == "0o600", f"vm setup stores key and power.toml privately {r.stderr[-200:]}")
+    r = sh(*vsetup[:3], "nbvm2", *vsetup[4:], env=venv, check_rc=False)
+    import tomllib
+    hosts = tomllib.loads(ptoml.read_text())["hosts"]
+    check(r.returncode == 0 and set(hosts) == {"nbvm", "nbvm2"} and hosts["nbvm"]["nebius"]["profile"] == "rjob-vm-power"
+          and "profile exists; reused" in r.stdout, "a second cloud VM reuses the profile and keeps the first entry")
+    r = sh(*vsetup, env=dict(venv, STUB_IAM_RC="0"), check_rc=False)
+    check(r.returncode != 0 and "broader" in r.stderr, "vm setup refuses a credential that can do more")
+    r = sh(sys.executable, str(REPO / "client/rjob"), "power", "status", "nbvm", check_rc=False,
+           env=dict(env, RJOB_POWER_CONFIG=str(ptoml)))
+    row = r.stdout.splitlines()[1].split("\t") if r.returncode == 0 else [r.stderr]
+    check(row[:2] == ["nbvm", "RUNNING"] and row[4] == "runner not answering yet",
+          f"rjob power status reads the cloud state through the nebius provider {row}")
 
 
 def wait_state_any(rj, job_id, states, timeout=30):
@@ -773,6 +887,7 @@ files = ["main.py"]
     print(rjob("list").stdout)
     multi_host()
     autostop()
+    rjob_power()
     nebius_setup_scripts()
     print(f"\n{len(FAILS)} failures" if FAILS else "\nall checks passed")
     if not FAILS:

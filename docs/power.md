@@ -5,9 +5,10 @@ A rented cloud VM bills compute for every hour it runs, busy or idle. On a paid 
 for `idle_minutes` (default 30). Disks persist while it is stopped: builds, mirrors,
 data and job results are all still there after the next start.
 
-Phase 1 (this doc): the host stops itself; you start it again from the provider's
-console or CLI. Later phases add `rjob power start|status|stop|hold` on the VM and
-let `rjob submit` start a stopped host on demand (issue #10).
+- **Stopping** is decided on the host, by itself (below).
+- **Starting** is done from the agents' VM with `rjob power start <alias>`, using a key
+  that may only power-operate the listed cloud VMs (see "Starting from the VM").
+- **Next:** `rjob submit` will start a stopped host on demand; that is part 3 of issue #10.
 
 ## Why it works this way
 
@@ -45,9 +46,8 @@ Checks that don't count as activity: `info`, `status` and `list`. So `rjob hosts
 
 **`request-stop`** (refused on hosts without autostop, such as the Mac) asks for a stop as soon as the host is idle. It skips the idle
 window and any hold, but still waits for running and queued jobs. `request-stop cancel`
-withdraws it. Phase 1 has no client command for these verbs yet: from the VM, run
-`ssh <alias> hold 2` or `ssh <alias> request-stop` (the locked key only reaches the runner).
-`rjob power` comes in phase 2.
+withdraws it. From the VM: `rjob power hold <alias> <hours>` and
+`rjob power stop <alias> [--cancel]`.
 
 **After a start,** `rjob-boot.service` clears the flags, restarts the idle clock and
 starts jobs that were still queued when the host went down. Jobs that were running when
@@ -104,15 +104,67 @@ For the manual steps behind the scripts, see Nebius's
 [authorized keys](https://docs.nebius.com/iam/service-accounts/authorized-keys) and
 [CLI without a browser](https://docs.nebius.com/cli/no-browser) pages.
 
+## Starting from the VM: `rjob power`
+
+| Command | What it does |
+|---|---|
+| `rjob power status [ALIAS]` | Shows the cloud state (provider API), cost per hour, running/queued jobs, the last autostop decision, hold, planned stop time and any stop request, for every host in `power.toml`. |
+| `rjob power start ALIAS` | Starts a `STOPPED` host and waits up to 10 min (`--timeout`) until its runner answers; `--no-wait` returns at once. A running host is left alone. A lock per alias stops two agents from starting it twice, and a host that is still `STOPPING` is started once the stop has finished. |
+| `rjob power stop ALIAS [--cancel]` | Asks the host to stop once it is idle (`request-stop`). The client never calls the provider's stop, so a busy host is never stopped through rjob. |
+| `rjob power hold ALIAS HOURS` | Keeps the host up (≤ 12 h; `0` clears it). Use it before a series of jobs or a long fetch session. |
+
+- **Stopped hosts are reported, not started.** Any other command that cannot reach a host
+  listed in `power.toml` says it may be stopped and names the two commands above. Only
+  `rjob power start` starts a host for now; automatic starts on submit come in part 3.
+- **Config.** `~/.config/rjob/power.toml` (`$RJOB_POWER_CONFIG`) must be mode 600; rjob
+  refuses it otherwise. It holds one `[hosts.<alias>]` table per cloud VM: `provider`,
+  plus `instance_id`, `profile` and `cli` in `[hosts.<alias>.nebius]`.
+  `vm/nebius-vm-setup.sh` writes it.
+- **The VM's key and the accepted risk.** This was the owner's choice over a start gate
+  on the Mac.
+  - The key lives in `~/.config/rjob/power/`, mode 600, and is used through a CLI profile
+    (default `rjob-vm-power`).
+  - Agents on the VM can read it. It can only view, start and stop the listed cloud VMs.
+  - The worst misuse is a raw stop that kills running jobs, or a start that the host's
+    autostop undoes 30 idle minutes later.
+  - Agents use `rjob power`, never the `nebius` CLI directly.
+  - Set a key expiry, and watch the Nebius audit log.
+
+### Setup on the agents' VM (once, then once per extra cloud VM)
+
+1. **On your laptop**, for the first cloud VM:
+   ```bash
+   bash host/power/nebius-grant-power.sh --for vm --tenant-id <tenant> --project-id <project> \
+     --instance-name <vm-name> [--expires-at 2027-10-22T00:00:00Z]
+   ```
+   This creates (or reuses) the account and group `rjob-vm-power`, a permit for
+   `compute.instance-power-operator` on that instance, and a key file.
+   For **each further cloud VM**, run the same command with `--no-key`. That adds a permit
+   for the new instance to the same group, and the existing key covers it.
+2. **Copy the key file to the agents' VM** (`/tmp/`) and delete the laptop copy.
+3. **On the agents' VM**, as its usual user, after installing the Nebius CLI
+   ([CLI install](https://docs.nebius.com/cli/install); linux/arm64 is supported):
+   ```bash
+   bash vm/nebius-vm-setup.sh --alias cpuserver --project-id <project> \
+     --instance-id <computeinstance-...> --credentials /tmp/rjob-vm-power.json
+   ```
+   - It moves the key into `~/.config/rjob/power/`, creates the profile and checks the
+     VM's state.
+   - It refuses a key that can do more than power operations.
+   - It writes `[hosts.cpuserver]` into `power.toml`.
+   - For further cloud VMs, run it again without `--credentials`.
+4. **Check:** `rjob power status`.
+
 ## Operating
 
 - **Last decision:** `rjob --host <alias> info` → `power.autostop.decision`, or on the
   host `cat /var/lib/rjob-power/status.json`.
-- **Pause:** from the VM `ssh <alias> hold <hours>` (`hold 0` clears it; `ssh <alias> request-stop` stops
-  once idle), or on the host `sudo systemctl stop rjob-autostop.timer`.
-  Resume with `sudo systemctl start rjob-autostop.timer`.
-- **Start:** in the Nebius console, or
-  `nebius compute instance start --id <instance-id>` with an account allowed to.
+- **Overview:** `rjob power status`.
+- **Pause:** `rjob power hold <alias> <hours>` (`0` clears it), or on the host
+  `sudo systemctl stop rjob-autostop.timer`. Resume with
+  `sudo systemctl start rjob-autostop.timer`.
+- **Start:** `rjob power start <alias>`, or the Nebius console.
+- **Stop now (once idle):** `rjob power stop <alias>`.
 - **Remove:** `sudo bash host/power/install-autostop.sh --uninstall`. It keeps
   `/etc/rjob-power`.
 
@@ -120,4 +172,5 @@ For the manual steps behind the scripts, see Nebius's
 
 `host/power/providers/<name>.py` exposes `state/start/stop(cfg)`. A new cloud needs one
 module (for example `aws ec2 start-instances` with an IAM policy scoped to the instance's
-ARN) and a `[<name>]` table in `autostop.toml`. Nothing else changes.
+ARN) and a `[<name>]` table in `autostop.toml` (host) or `power.toml` (VM). The VM
+client loads the same modules from `host/power/providers/`. Nothing else changes.

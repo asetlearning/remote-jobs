@@ -1,6 +1,8 @@
 """Fake power provider for tests: the instance state lives in a JSON file.
 
-Config ([fake]): state_file = "/path/state.json"; fail = true makes every call raise.
+Config ([fake]): state_file = "/path/state.json"; fail = true makes every call raise;
+down_marker = "/path" is created by stop and removed by start (the tests' fake ssh
+treats a host with that file as unreachable). start/stop are instantaneous.
 The file holds {"state": "RUNNING", "calls": ["stop", ...]}.
 """
 # Created by: Alex Myasnikov
@@ -33,7 +35,11 @@ def state(cfg: dict) -> str:
 
 def start(cfg: dict) -> None:
     _set(cfg, "start", "RUNNING")
+    if cfg.get("down_marker"):
+        Path(cfg["down_marker"]).unlink(missing_ok=True)
 
 
 def stop(cfg: dict) -> None:
     _set(cfg, "stop", "STOPPED")
+    if cfg.get("down_marker"):
+        Path(cfg["down_marker"]).touch()

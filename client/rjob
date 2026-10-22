@@ -8,6 +8,10 @@
     rjob fetch ID [--dest DIR] [--include GLOB]... resumable download of the job's outputs
     rjob hosts                                     capacity, load, cost and hour limit of every project host
     rjob cost [--since YYYY-MM-DD] [--host H]      hours and cost of recorded jobs, per job and per host
+    rjob power status [ALIAS]                      cloud state, autostop decision, hold of power-managed hosts
+    rjob power start ALIAS [--no-wait]             start a stopped cloud host, wait until its runner answers
+    rjob power stop ALIAS [--cancel]               stop it once idle (the host decides; never kills jobs)
+    rjob power hold ALIAS HOURS                    keep it up for up to 12 h (0 clears)
     rjob list [--all] | info                       jobs / info of one host (--all: every project host)
     rjob push REPO_PATH [REV]                      ship a commit (normally done by submit)
     rjob put-data FILE                             upload a large input once; prints sha256:...
@@ -26,6 +30,10 @@ the job's timeout_hours while another capable host exists; without a project: "m
 Commands on a job id use the host recorded at submit; --host overrides. A job
 missing from the record: $RJOB_HOST, else the project host that knows the id,
 else "mac".
+Power: ~/.config/rjob/power.toml ($RJOB_POWER_CONFIG, mode 600) lists the cloud hosts
+rjob may start, with their provider and instance (docs/power.md). The client only reads
+state and starts; stops are decided by the host's autostop (request-stop), so a busy
+host is never stopped through rjob.
 $RJOB_SSH overrides the ssh command (tests).
 Local record of submitted jobs: ~/.local/state/rjob/jobs.jsonl.
 Python 3.11+ standard library only.
@@ -37,11 +45,14 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime
+import fcntl
+import importlib
 import fnmatch
 import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -58,6 +69,8 @@ TERMINAL = {"done", "failed", "cancelled", "timeout", "dead"}
 GPU_DEVICES = ("mps", "cuda", "gpu", "auto")
 PROJECT_FILE = "rjob.toml"
 DEFAULT_TIMEOUT_HOURS = 24  # the host runner's default for resources.timeout_hours
+POWER_CONFIG = Path(os.environ.get("RJOB_POWER_CONFIG", Path.home() / ".config/rjob/power.toml")).expanduser()
+PROVIDERS = Path(__file__).resolve().parents[1] / "host/power"   # providers/ shared with the host watchdog
 
 
 def die(msg: str, code: int = 2):
@@ -72,17 +85,28 @@ def ssh_cmd(host: str, words: list[str]) -> list[str]:
     return base + [host, shlex.join(words)]
 
 
+def remote_failed(host: str, words: list[str], p) -> None:
+    msg = f"{words[0]} failed: {p.stderr.decode(errors='replace').strip()}"
+    try:
+        managed = p.returncode == 255 and host in power_hosts(quiet=True)  # ssh could not connect
+    except Exception:  # a broken power.toml must not hide the real error
+        managed = False
+    if managed:
+        msg += f"\n{host} is a cloud host and may be stopped: rjob power status {host}; rjob power start {host}"
+    die(msg, p.returncode or 1)
+
+
 def remote(host: str, words: list[str], stdin: bytes | None = None, check=True) -> bytes:
     p = subprocess.run(ssh_cmd(host, words), input=stdin or b"", capture_output=True)
     if check and p.returncode != 0:
-        die(f"{words[0]} failed: {p.stderr.decode(errors='replace').strip()}", p.returncode or 1)
+        remote_failed(host, words, p)
     return p.stdout
 
 
 def remote_stream(host: str, words: list[str], stdin_file) -> bytes:
     p = subprocess.run(ssh_cmd(host, words), stdin=stdin_file, capture_output=True)
     if p.returncode != 0:
-        die(f"{words[0]} failed: {p.stderr.decode(errors='replace').strip()}", p.returncode or 1)
+        remote_failed(host, words, p)
     return p.stdout
 
 
@@ -593,6 +617,108 @@ def cmd_cost(a) -> None:
         print(f"total\tall\t\t\t{sum(t[0] for t in totals.values()):.2f}\t\t{sum(t[1] for t in totals.values()):.2f}")
 
 
+# --------------------------------------------------------------------- power
+
+def power_hosts(quiet: bool = False) -> dict:
+    """The [hosts.<alias>] tables of the VM's power.toml; {} when there is none."""
+    if not POWER_CONFIG.is_file():
+        return {}
+    if POWER_CONFIG.stat().st_mode & 0o077:
+        if quiet:
+            return {}
+        die(f"{POWER_CONFIG} is readable by others; chmod 600 it (it names the cloud key)")
+    return tomllib.loads(POWER_CONFIG.read_text()).get("hosts", {})
+
+
+def power_provider(alias: str):
+    """(module, provider config) for a host in power.toml. Clients use only state() and start()."""
+    entry = power_hosts().get(alias)
+    if entry is None:
+        die(f"{alias} is not in {POWER_CONFIG}; rjob power starts only hosts listed there (docs/power.md)")
+    name = entry.get("provider", "")
+    if not re.match(r"^[a-z][a-z0-9_]{0,30}$", name):
+        die(f"{POWER_CONFIG}: hosts.{alias}.provider must name a module in host/power/providers")
+    if str(PROVIDERS) not in sys.path:
+        sys.path.insert(0, str(PROVIDERS))
+    return importlib.import_module(f"providers.{name}"), dict(entry.get(name, {}))
+
+
+def provider_state(alias: str) -> str:
+    mod, cfg = power_provider(alias)
+    try:
+        return mod.state(cfg)
+    except Exception as exc:  # ProviderError, or a missing CLI
+        return f"error: {exc}"
+
+
+def power_status_row(alias: str, rate: float) -> str:
+    state = provider_state(alias)
+    info = host_info(alias) if state == "RUNNING" else None
+    pw = (info or {}).get("power") or {}
+    auto = pw.get("autostop") or {}
+    jobs = f"{len(info.get('running', []))}/{len(info.get('queued', []))}" if info else "-"
+    if state == "RUNNING" and info is None:
+        decision = "runner not answering yet"
+    elif info and not pw:
+        decision = "runner without autostop"
+    else:
+        decision = auto.get("decision") or ("stopping" if pw.get("stopping") else "-")
+    return (f"{alias}\t{state}\t{rate:g}\t{jobs}\t{decision}\t{pw.get('hold_until') or '-'}"
+            f"\t{auto.get('stop_at') or '-'}\t{'yes' if pw.get('stop_requested') else '-'}")
+
+
+def power_start(alias: str, rate: float, wait: bool, timeout: float) -> None:
+    """Start a stopped host (idempotent; one starter per alias), then wait for its runner."""
+    mod, cfg = power_provider(alias)
+    STATE.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    with open(STATE / f"power-{alias}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        while True:
+            try:
+                state = mod.state(cfg)
+            except Exception as exc:
+                die(f"{alias}: cannot read the cloud state: {exc}")
+            if state == "STOPPED":
+                print(f"starting {alias}" + (f" ({rate:g}/h)" if rate else ""), file=sys.stderr)
+                try:
+                    mod.start(cfg)
+                except Exception as exc:
+                    die(f"{alias}: start failed: {exc}")
+                break
+            if state in ("RUNNING", "STARTING"):
+                break
+            if state != "STOPPING" or time.time() - t0 > timeout:
+                die(f"{alias}: cloud state {state}; not starting it")
+            time.sleep(10)  # a stop in progress: start once it has finished
+    if not wait:
+        return
+    while host_info(alias) is None:
+        if time.time() - t0 > timeout:
+            die(f"{alias} did not answer within {timeout:.0f} s after the start; rjob power status {alias}")
+        time.sleep(10)
+    print(f"{alias} is up ({time.time() - t0:.0f} s)", file=sys.stderr)
+
+
+def cmd_power(a) -> None:
+    proj = load_project(a.project)
+    if a.action == "status":
+        aliases = [a.alias] if a.alias else list(power_hosts())
+        if not aliases:
+            die(f"no hosts in {POWER_CONFIG} (docs/power.md)")
+        print("host\tcloud\tcost/h\trunning/queued\tautostop\thold_until\tstop_at\tstop_requested")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(aliases)) as ex:
+            rows = ex.map(lambda al: power_status_row(al, float(host_entry(proj, al).get("cost_per_hour", 0))), aliases)
+            for row in rows:
+                print(row)
+    elif a.action == "start":
+        power_start(a.alias, float(host_entry(proj, a.alias).get("cost_per_hour", 0)), not a.no_wait, a.timeout)
+    elif a.action == "stop":
+        sys.stdout.buffer.write(remote(a.alias, ["request-stop"] + (["cancel"] if a.cancel else [])))
+    elif a.action == "hold":
+        sys.stdout.buffer.write(remote(a.alias, ["hold", a.hours]))
+
+
 def cmd_list(a) -> None:
     if not a.all:
         sys.stdout.buffer.write(remote(default_host(a), ["list"]))
@@ -632,6 +758,13 @@ def main() -> None:
     sp.add_parser("hosts").set_defaults(fn=cmd_hosts)
     p = sp.add_parser("cost"); p.add_argument("--since", help="only jobs submitted on or after YYYY-MM-DD")
     p.set_defaults(fn=cmd_cost)
+    p = sp.add_parser("power"); pw = p.add_subparsers(dest="action", required=True)
+    q = pw.add_parser("status"); q.add_argument("alias", nargs="?")
+    q = pw.add_parser("start"); q.add_argument("alias"); q.add_argument("--no-wait", action="store_true")
+    q.add_argument("--timeout", type=float, default=600, help="seconds to wait for the runner (default 600)")
+    q = pw.add_parser("stop"); q.add_argument("alias"); q.add_argument("--cancel", action="store_true")
+    q = pw.add_parser("hold"); q.add_argument("alias"); q.add_argument("hours")
+    p.set_defaults(fn=cmd_power)
     p = sp.add_parser("wait"); p.add_argument("id"); p.add_argument("--interval", type=float, default=60)
     p.set_defaults(fn=cmd_wait)
     p = sp.add_parser("fetch"); p.add_argument("id"); p.add_argument("--dest")
