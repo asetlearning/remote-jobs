@@ -193,6 +193,61 @@ def multi_host():
     check(host_of(rj("submit", str(spec("p-pin", "cpus = 1", extra='host = "gpux"\n')), "--dry-run")) == "gpux",
           "job.toml host pins placement")
 
+    # per-host max_hours and cost_per_hour (project file only; hosts unchanged)
+    cost = proj / "cost.toml"
+    cost.write_text('runs_dir = "runs"\n[[hosts]]\nalias = "macx"\nmax_hours = 2\n'
+                    '[[hosts]]\nalias = "gpux"\ncost_per_hour = 1.5\n')
+    cp = ("--project", str(cost))
+    check(host_of(rj(*cp, "submit", str(spec("h-short", "cpus = 1\ntimeout_hours = 2")), "--dry-run")) == "macx",
+          "job within max_hours stays on the first host")
+    r = rj(*cp, "submit", str(spec("h-long", "cpus = 1\ntimeout_hours = 3")), "--dry-run")
+    check(host_of(r) == "gpux" and "macx: max_hours 2 < timeout_hours 3" in r.stderr,
+          "job longer than max_hours skips that host, with the reason")
+    check(host_of(rj(*cp, "submit", str(spec("h-default", "cpus = 1")), "--dry-run")) == "gpux",
+          "no timeout_hours counts as the host default (24 h)")
+    r = rj(*cp, "submit", str(spec("h-mps", 'device = "mps"\ntimeout_hours = 3')), "--dry-run")
+    check(host_of(r) == "macx" and "no capable host within max_hours" in r.stderr,
+          "long mps job with no other mps host still goes to the limited host, with the reason")
+    alt = proj / "alt.toml"
+    alt.write_text('[[hosts]]\nalias = "macx"\nmax_hours = 2\n[[hosts]]\nalias = "deadhost"\n')
+    r = rj("--project", str(alt), "submit", str(spec("h-alt-dead", "cpus = 1\ntimeout_hours = 3")), "--dry-run")
+    check(host_of(r) == "macx" and "deadhost: unreachable" in r.stderr,
+          "unreachable alternative: the limited host takes the long job")
+    r = rj(*cp, "submit", str(spec("h-pin", "cpus = 1\ntimeout_hours = 3")), "--host", "macx", "--dry-run")
+    check(host_of(r) == "macx" and "warning: macx is pinned although max_hours 2" in r.stderr,
+          "--host overrides max_hours, with a warning")
+    r = rj(*cp, "submit", str(spec("h-cost", "cpus = 1\ntimeout_hours = 3")), "--dry-run")
+    check("cost: <= 4.50 (1.5/h x timeout_hours 3)" in r.stderr, "submit prints the cost bound")
+    check("cost:" not in rj(*cp, "submit", str(spec("h-free", "cpus = 1\ntimeout_hours = 1")), "--dry-run").stderr,
+          "free hosts print no cost line")
+    one = proj / "one.toml"
+    one.write_text('[[hosts]]\nalias = "macx"\nmax_hours = 2\n')
+    r = rj("--project", str(one), "submit", str(spec("h-one", "cpus = 1\ntimeout_hours = 3")), "--dry-run")
+    check(host_of(r) == "macx" and "max_hours 2 < timeout_hours 3, no other host" in r.stderr,
+          "single-host project: the only host takes a long job, with the reason")
+    check("warning" not in r.stderr, "no pin warning when the host was not pinned")
+    for bad in ("cost_per_hour = -1", 'cost_per_hour = "free"', "max_hours = 0"):
+        one.write_text(f'[[hosts]]\nalias = "macx"\n{bad}\n')
+        r = rj("--project", str(one), "submit", str(spec("h-bad", "cpus = 1")), "--dry-run", check_rc=False)
+        check(r.returncode != 0 and "must be a number" in r.stderr, f"bad host field rejected: {bad}")
+    lines = {l.split("\t")[0]: l.split("\t") for l in rj(*cp, "hosts").stdout.splitlines()}
+    check(lines["gpux"][-2:] == ["1.5", "-"] and lines["macx"][-2:] == ["0", "2"], "rjob hosts shows cost/h and max_hours")
+    paid = rj(*cp, "submit", str(spec("h-paid", "cpus = 1\ntimeout_hours = 3", t="1"))).stdout.strip()
+    wait_state_any(rj, paid, {"done"})
+    rec_paid = [json.loads(l) for l in (TMP / "state/jobs.jsonl").read_text().splitlines() if paid in l][0]
+    check(rec_paid["cost_per_hour"] == 1.5, "record keeps the cost rate")
+    out = rj("cost", "--host", "gpux").stdout
+    row = next(l.split("\t") for l in out.splitlines() if l.startswith(paid))
+    check(row[3] == "done" and row[5] == "1.5" and 0 <= float(row[6]) < 0.01, f"rjob cost prices a finished job {row}")
+    check(any(l.startswith("total\tgpux\t") for l in out.splitlines()), "rjob cost totals per host")
+    check(len(rj("cost", "--since", "2099-01-01").stdout.splitlines()) == 1, "rjob cost --since filters")
+    rj("cleanup", "job", paid)
+    cl = load_client()
+    check(cl.busy_hours({"started": "2026-10-21T10:00:00+0000", "finished": "2026-10-21T11:30:00+0000"}) == 1.5,
+          "busy hours from the host's timestamps")
+    check(cl.busy_hours({"started": "yesterday"}) is None and cl.busy_hours({}) is None,
+          "unparsable or missing start leaves a job unpriced")
+
     # spill: fill macx's CPU slots, next CPU job goes to gpux; runs_dir from project
     full = rj("submit", str(spec("fill-mac", "cpus = 2"))).stdout.strip()
     wait_state_any(rj, full, {"running"})

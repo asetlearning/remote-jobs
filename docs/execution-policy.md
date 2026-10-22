@@ -16,6 +16,12 @@
   - Examples: 2.5-reduction in certify mode on large or long-word sets, Todd–Coxeter experiments, and local-search sweeps.
 - **Long unattended runs.** Use `rjob wait` in the background and fetch when it finishes.
 
+## Which remote host
+
+- **The Mac takes jobs that finish within 2 hours** (`timeout_hours <= 2`). Longer jobs go to the remote servers, and to the Mac only when no other host can run them (an MPS/GPU job with no GPU server, or no reachable server at all). A project sets this with `max_hours = 2` on its `mac` entry in `rjob.toml`; the host list may change, and placement re-checks it on every submit.
+- **Set `timeout_hours` honestly.** It is both the hard kill limit and the length that placement and cost estimates use; a job without it counts as 24 h, so it lands on the Mac only when nothing else can run it.
+- **Paid hosts carry `cost_per_hour`.** Before a long or wide run, check the `cost:` line of `rjob submit --dry-run`, and review spending with `rjob cost --since <date>`.
+
 ## Rules
 
 - **Code goes through git.** Commit to an experiment branch; the client refuses dirty trees. Never merge into a repo's `main` without the owner's approval. Pushing to GitHub is not needed, because commits travel as bundles.
