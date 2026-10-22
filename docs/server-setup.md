@@ -42,6 +42,7 @@ This adds a Linux server (x86_64, NVIDIA GPUs or CPU only) as a remote-jobs host
 
      With Tailscale, `from=` is the address the server sees: the tailnet address of the machine the VM routes through (for a Parallels VM without its own Tailscale, the Mac's `100.x` address).
 5. **Slots (optional).** Edit `~/rjob/config.toml`: `gpu_ids` (a subset reserves GPUs for other users), `cpu_slots`, `mem_gb`.
+5a. **Paid cloud VM: autostop (admin).** Follow [power.md](power.md) so the VM stops itself through the provider API after 30 idle minutes. Don't use a cron `shutdown`: on Nebius a shutdown from inside the guest reboots the VM and keeps billing.
 
 ## VM
 

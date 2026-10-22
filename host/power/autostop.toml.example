@@ -1,0 +1,17 @@
+# /etc/rjob-power/autostop.toml — config of rjob-autostop (root-owned, mode 600).
+# install-autostop.sh writes this template if the file is missing; fill in the
+# [nebius] values, then run it again.
+
+worker = "cpuworker"                                   # the remote-jobs worker account
+runner_python = "/home/cpuworker/rjob/bin/python3"     # run as the worker, never as root
+runner = "/home/cpuworker/rjob/bin/run_job.py"
+rjob_root = "/home/cpuworker/rjob"                     # the worker's RJOB_ROOT
+idle_minutes = 30                                      # idle time before the host stops itself
+# logins_cmd = ["who"]                                 # any output line = someone logged in: no stop
+
+provider = "nebius"
+
+[nebius]
+instance_id = "computeinstance-REPLACE-ME"             # this VM: `nebius compute instance list`
+profile = "rjob-autostop"                              # root's CLI profile for the power-operator service account
+cli = "/root/.nebius/bin/nebius"

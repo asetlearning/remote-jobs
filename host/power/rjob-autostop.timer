@@ -1,0 +1,12 @@
+# Installed by install-autostop.sh. The first check comes 10 min after boot; together
+# with the boot unit's fresh idle clock, a started host stays up for at least idle_minutes.
+[Unit]
+Description=remote-jobs: check every 5 min whether this cloud VM may stop
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

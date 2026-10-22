@@ -351,6 +351,176 @@ def multi_host():
     check(rec.place(pr, {"device": "cpu"})[0] == "busy", "old-style info: idle host is used")
 
 
+def autostop():
+    """Server autostop: host/power/rjob-autostop with the fake provider against a test host `pw`."""
+    import getpass
+    import signal
+    home = TMP / "home-pw"
+    setup_host(home, "cpu_slots = 2\nmem_gb = 10\n")
+    os.environ["RJOB_AUTOSTOP_STATUS"] = str(TMP / "pw-status.json")
+    r = sh(os.environ["RJOB_SSH"], "pw", "request-stop", check_rc=False)
+    check(r.returncode == 2 and "no autostop" in r.stderr, "request-stop refused on a host without autostop")
+    os.environ["RJOB_AUTOSTOP_BIN"] = str(REPO / "host/power/rjob-autostop")
+    fake_state = TMP / "pw-fake.json"
+    cfg = TMP / "autostop.toml"
+
+    def write_cfg(logins='["true"]', fail="false"):
+        cfg.write_text(f'worker = "{getpass.getuser()}"\nrunner_python = "{sys.executable}"\n'
+                       f'runner = "{home}/rjob/bin/run_job.py"\nrjob_root = "{home}/rjob"\n'
+                       f'idle_minutes = 0.05\nlogins_cmd = {logins}\nprovider = "fake"\n'
+                       f'[fake]\nstate_file = "{fake_state}"\nfail = {fail}\n')
+    write_cfg()
+    bare = [sys.executable, str(REPO / "client/rjob"), "--host", "pw"]
+
+    def rj(*args, check_rc=True):
+        return sh(*bare, *args, check_rc=check_rc)
+
+    def wd(*args):
+        r = sh(sys.executable, str(REPO / "host/power/rjob-autostop"), *args, check_rc=False,
+               env=dict(os.environ, RJOB_AUTOSTOP_CONFIG=str(cfg)))
+        return r.returncode, json.loads(r.stdout) if r.stdout.strip().startswith("{") else {"raw": r.stdout + r.stderr}
+
+    def runner(*args):
+        return sh(sys.executable, str(home / "rjob/bin/run_job.py"), *args,
+                  env=dict(os.environ, RJOB_ROOT=str(home / "rjob")))
+
+    def verb(cmd, check_rc=True):  # runner verbs without a client command yet (rjob power: phase 2)
+        return sh(os.environ["RJOB_SSH"], "pw", cmd, check_rc=check_rc)
+
+    def calls():
+        return json.loads(fake_state.read_text())["calls"] if fake_state.exists() else []
+
+    def boot():
+        runner("_power-boot")
+        st = json.loads(fake_state.read_text()) if fake_state.exists() else {"calls": []}
+        fake_state.write_text(json.dumps({**st, "state": "RUNNING"}))
+
+    stopping = home / "rjob/power/stopping"
+    idle = lambda: time.sleep(3.3)  # past idle_minutes = 0.05
+    sleeper = "import os, time\nos.makedirs('outputs', exist_ok=True)\ntime.sleep(float(open('t').read()))\n"
+
+    def job(name, t, res="cpus = 1"):
+        spec = write_spec(TMP / "pwjobs" / name, f'name = "{name}"\n[resources]\n{res}\n[run]\n'
+                          'argv = ["python", "main.py"]\nfiles = ["main.py", "t"]\n', {"main.py": sleeper, "t": str(t)})
+        return rj("submit", str(spec), check_rc=False)
+
+    j = job("as-busy", 4).stdout.strip()
+    wait_state_any(rj, j, {"running"})
+    rc, st = wd()
+    check(st.get("decision", "").startswith("wait: busy") and not calls(), f"autostop waits while a job runs ({st.get('decision')})")
+    wait_state_any(rj, j, {"done"})
+    rc, st = wd()
+    check(st.get("decision", "").startswith("wait: idle") and not calls(), "autostop waits for the idle window after a job")
+    idle()
+    rj("info")
+    rj("status", j)
+    rj("list")
+    rc, st = wd()
+    check(rc == 0 and st.get("decision", "").startswith("stop sent") and calls() == ["stop"],
+          f"idle host stops through the provider; info/status/list are not activity ({st.get('decision')})")
+    check(stopping.exists(), "stopping marker set before the stop")
+    r = job("as-late", 0)
+    check(r.returncode != 0 and "host is stopping" in r.stderr, "submit refused while the host is stopping")
+    pw = json.loads(rj("info").stdout)["power"]
+    check(pw["stopping"] and pw["autostop"]["decision"].startswith("stop sent"), "info reports the power state and last decision")
+    idle()  # the refused submit was runner activity
+    rc, st = wd()
+    check(st.get("decision") == "no action: instance is STOPPED" and calls() == ["stop"], "no second stop for a stopped instance")
+    boot()
+    check(not stopping.exists(), "boot clears the stopping marker")
+
+    check(verb("hold 1").returncode == 0, "hold accepted")
+    idle()
+    rc, st = wd()
+    check(st.get("decision", "").startswith("wait: hold") and calls() == ["stop"], "hold keeps an idle host up")
+    check(verb("hold 13", check_rc=False).returncode != 0, "hold over 12 h rejected")
+    check(verb("hold 1;id", check_rc=False).returncode != 0, "malformed hold rejected")
+    verb("request-stop")
+    rc, st = wd()
+    check(st.get("decision") == "stop sent: stop requested" and calls() == ["stop", "stop"], "request-stop overrides a hold")
+    boot()
+    verb("hold 0")
+    check(not (home / "rjob/power/stop_requested").exists(), "boot clears the stop request")
+
+    idle()
+    rj("logs", j)
+    rc, st = wd()
+    check(st.get("decision", "").startswith("wait: idle"), "a runner command restarts the idle clock")
+
+    write_cfg(logins='["echo", "someone pts/0"]')
+    idle()
+    rc, st = wd()
+    check(st.get("decision", "").startswith("wait: 1 interactive login") and not stopping.exists(),
+          "no stop while someone is logged in")
+    write_cfg(fail="true")
+    rc, st = wd()
+    check(rc == 1 and st.get("error") and st.get("decision") == "error: host stays up" and not stopping.exists(),
+          "provider failure: host stays up and accepts jobs")
+    write_cfg()
+    rc, st = wd("--dry-run")
+    check(st.get("decision", "").startswith("would stop") and calls() == ["stop", "stop"] and not stopping.exists(),
+          "dry run decides but never stops")
+
+    j = job("as-drain", 3).stdout.strip()
+    wait_state_any(rj, j, {"running"})
+    verb("request-stop")
+    rc, st = wd()
+    check(st.get("decision", "").startswith("wait: busy") and calls() == ["stop", "stop"], "request-stop never stops a busy host")
+    wait_state_any(rj, j, {"done"})
+    rc, st = wd()
+    check(st.get("decision") == "stop sent: stop requested", "requested stop happens once the host is idle, without the idle window")
+    boot()
+
+    # jobs queued when the host went down (raw stop) start at boot
+    a = job("as-a", 60, "cpus = 1\nmem_gb = 6").stdout.strip()
+    wait_state_any(rj, a, {"running"})
+    b = job("as-b", 0, "cpus = 1\nmem_gb = 6").stdout.strip()
+    check(json.loads(rj("status", b).stdout)["state"] == "queued", "second job queued behind the memory budget")
+    sa = json.loads(rj("status", a).stdout)
+    for pid in (sa.get("child_pgid"), sa.get("pid")):
+        if pid:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    time.sleep(0.5)
+    check(json.loads(rj("status", a).stdout)["state"] == "dead", "killed job shows dead, like a raw stop")
+    time.sleep(1)
+    check(json.loads(rj("status", b).stdout)["state"] == "queued", "nothing starts the queued job before boot")
+    runner("_power-boot")
+    check(wait_state_any(rj, b, {"done"})["state"] == "done", "boot unit starts jobs queued before the stop")
+
+    # nebius provider: CLI calls and their arguments, with a stub `nebius`
+    stub = TMP / "nebius-stub"
+    log = TMP / "nebius-argv.log"
+    stub.write_text(f'#!/bin/bash\necho "$*" >> {log}\n[[ "$3" == get ]] && echo \'"running"\'\nexit 0\n')
+    stub.chmod(0o755)
+    sys.path.insert(0, str(REPO / "host/power"))
+    from providers import ProviderError, nebius
+    ncfg = {"cli": str(stub), "instance_id": "computeinstance-e00abc", "profile": "rjob-autostop"}
+    check(nebius.state(ncfg) == "RUNNING", "nebius provider reads .status.state, unquoted and upper-cased")
+    nebius.stop(ncfg)
+    nebius.start(ncfg)
+    lines = log.read_text().splitlines()
+    check(lines[0].startswith("compute instance get --format jsonpath={.status.state} --id computeinstance-e00abc")
+          and all("--profile rjob-autostop" in l for l in lines), f"nebius get/profile arguments {lines[0]}")
+    check(lines[1].startswith("compute instance stop --async") and lines[2].startswith("compute instance start --async"),
+          "nebius stop and start are asynchronous")
+    for badcfg in ({**ncfg, "instance_id": "x; rm -rf /"}, {**ncfg, "profile": "--debug"}, {**ncfg, "cli": "/nonexistent"}):
+        try:
+            nebius.state(badcfg)
+            ok = False
+        except ProviderError:
+            ok = True
+        check(ok, f"nebius provider rejects {sorted(set(badcfg.items()) - set(ncfg.items()))}")
+
+    env = dict(os.environ, HOME=str(home))
+    bad = [c for c in ("_power-check 1 1", "_power-abort", "_power-boot", "hold", "request-stop now")
+           if subprocess.run([str(home / "rjob/bin/run-job")], env=dict(env, SSH_ORIGINAL_COMMAND=c),
+                             capture_output=True, text=True).returncode != 2]
+    check(not bad, f"internal power verbs and bad arguments rejected over ssh {bad}")
+
+
 def wait_state_any(rj, job_id, states, timeout=30):
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -509,6 +679,7 @@ files = ["main.py"]
     check(info["slots"]["cpu"] == 2 and "builds" in info, "info reports slots and builds")
     print(rjob("list").stdout)
     multi_host()
+    autostop()
     print(f"\n{len(FAILS)} failures" if FAILS else "\nall checks passed")
     if not FAILS:
         shutil.rmtree(TMP, ignore_errors=True)

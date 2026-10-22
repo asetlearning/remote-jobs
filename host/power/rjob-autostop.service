@@ -1,0 +1,10 @@
+# Installed by install-autostop.sh to /etc/systemd/system/. Root: it holds the
+# provider credential, which the worker account (and so job code) cannot read.
+[Unit]
+Description=remote-jobs: stop this cloud VM when the runner is idle
+After=network-online.target rjob-boot.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/rjob-power/rjob-autostop

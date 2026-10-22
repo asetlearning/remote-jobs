@@ -15,4 +15,5 @@ Host gpuserver
     IdentityFile ~/.ssh/rjob_gpuserver
     IdentitiesOnly yes
     ServerAliveInterval 60
+    ConnectTimeout 10        # a stopped cloud VM drops packets: fail in 10 s, not minutes
 #   ProxyJump bastion.example.org   # only if the server is not directly reachable
