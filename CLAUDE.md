@@ -9,7 +9,7 @@ This repo is the bridge from the sandboxed agent VM to remote compute hosts. Kee
 | `host/run_job.py` | The whole host side: SSH verb dispatch, git mirrors, per-SHA builds, scheduler (GPU ids, CPU slots, mem_gb), supervisor, manifest, fetch. Stdlib only, Python 3.11+ |
 | `host/run-job` | The forced-command shim that `authorized_keys` points at |
 | `host/install.sh` | Host setup, run as the worker account |
-| `host/power/` | Autostop for paid cloud hosts: `rjob-autostop` (root, systemd timer), `providers/` (`nebius`, `fake`), units, `install-autostop.sh` (root). See `docs/power.md` |
+| `host/power/` | Autostop for paid cloud hosts: `rjob-autostop` (root, systemd timer), `providers/` (`nebius`, `fake`), units, `install-autostop.sh` (root), per-instance Nebius setup `nebius-grant-power.sh` (laptop, admin) and `nebius-setup-profile.sh` (VM, root). See `docs/power.md` |
 | `client/rjob` | The VM client: project host lists (`rjob.toml`, with optional `cost_per_hour` and `max_hours` per host), placement, recorded hosts, `rjob cost`; stdlib only |
 | `client/capjob` | Local runs on the VM inside a memory/CPU cap (systemd user scope, oom_score_adj 1000); when the cap kills the job, it falls back to `rjob submit`. Stdlib only |
 | `examples/` | Job specs: `smoke-device`, `smoke-device-cuda`, `b25-build`, `pb-smoke`; `project-rjob.toml` (per-project host list) |

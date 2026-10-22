@@ -56,33 +56,53 @@ them.
 
 ## Setup on a Nebius host (owner; needs Nebius admin and root on the host)
 
-1. **Service account and its permission** (Nebius console, IAM):
-   - Create a service account, e.g. `rjob-autostop-<host>`.
-   - Create a group, e.g. `rjob-power-<host>`, and add the service account to it.
-   - Give the group an access permit with role **`compute.instance-power-operator`**,
-     scoped to **this instance only** (resource = the VM, not the project). That role
-     can view, start and stop VMs and view operations, nothing else.
-2. **Key and CLI profile** (on the host, as root):
-   - Install the Nebius CLI for root. See the
-     [CLI install docs](https://docs.nebius.com/cli/install).
-   - Create an authorized key for the service account and a CLI profile named
-     `rjob-autostop` that uses it. See
-     [Authenticating as a service account](https://docs.nebius.com/iam/service-accounts/authorized-keys).
-     Store the credentials file in `/etc/rjob-power/`, owned by root with mode 600.
-   - Check it: `nebius compute instance get --id <instance-id> --profile rjob-autostop`.
-3. **Runner up to date:** as the worker, re-run `host/install.sh`, which gives the
-   runner the `_power-*` verbs.
-4. **Install** (as root):
+Two scripts do the per-instance work. Each step is explained in the scripts' comments.
+Both are safe to re-run: existing resources are reused, and nothing that is already
+filled in is overwritten.
+
+1. **On your laptop** (Nebius CLI logged in as a tenant admin; macOS bash is fine):
    ```bash
-   sudo bash /path/to/remote-jobs/host/power/install-autostop.sh   # first run writes /etc/rjob-power/autostop.toml
-   sudoedit /etc/rjob-power/autostop.toml                           # worker, instance_id, profile
-   sudo bash /path/to/remote-jobs/host/power/install-autostop.sh   # installs, tests the credential, enables the timer
+   bash host/power/nebius-grant-power.sh --tenant-id <tenant> --project-id <project> \
+     --instance-name <vm-name> [--expires-at 2027-10-22T00:00:00Z]
    ```
-   The installer refuses to enable the timer if the provider check fails, or if the provider reports anything
-   other than `RUNNING` for this (running) host. If that happens, report the state it printed: the code assumes
-   Nebius's state names are `RUNNING`, `STOPPING` and `STOPPED`.
-5. **Budget alert** in the Nebius console. It's the backstop if the watchdog ever
+   This creates or reuses:
+   - service account `rjob-autostop-<vm>`;
+   - group `rjob-power-<vm>`, with the account as a member;
+   - an access permit for `compute.instance-power-operator`, scoped to **this instance
+     only**, so the account can view, start and stop this one VM and do nothing else;
+   - a new authorized key, written as `rjob-autostop-<vm>.json` with mode 600. The file
+     is a secret.
+
+   It then prints the next two commands with the ids filled in. Use `--suffix` to pick
+   the names; for example, `--suffix cpuserver` reuses an account and group created by
+   hand under those names.
+2. **Copy the credentials file to the VM** and delete the laptop copy (the printed
+   command uses `scp` to `/tmp/`, then `rm -P`).
+3. **On the VM, as root**, after installing the Nebius CLI for root
+   ([CLI install](https://docs.nebius.com/cli/install)):
+   ```bash
+   sudo bash host/power/nebius-setup-profile.sh --credentials /tmp/rjob-autostop-<vm>.json \
+     --project-id <project> --instance-id <computeinstance-...> [--worker cpuworker]
+   ```
+   It:
+   - moves the key to `/etc/rjob-power/` (root only, mode 600);
+   - creates root's CLI profile `rjob-autostop`;
+   - checks that the profile reads this VM as `RUNNING`;
+   - checks that it can do nothing else (an IAM listing must be denied), and refuses to
+     go on if the permit is broader than that;
+   - writes `/etc/rjob-power/autostop.toml`.
+4. **Bring the runner up to date:** run `sudo -iu <worker> bash host/install.sh`, which
+   gives the runner the `_power-*` verbs.
+5. **Install the watchdog:** run `sudo bash host/power/install-autostop.sh`. It refuses to
+   enable the timer if the provider check fails or reports anything other than `RUNNING`.
+   In that case, report the state it printed: the code assumes Nebius's state names are
+   `RUNNING`, `STOPPING` and `STOPPED`.
+6. **Set a budget alert** in the Nebius console. It's the backstop if the watchdog ever
    fails silently.
+
+For the manual steps behind the scripts, see Nebius's
+[authorized keys](https://docs.nebius.com/iam/service-accounts/authorized-keys) and
+[CLI without a browser](https://docs.nebius.com/cli/no-browser) pages.
 
 ## Operating
 
