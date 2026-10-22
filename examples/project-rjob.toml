@@ -14,6 +14,9 @@ runs_dir = "runs"          # default for this project's jobs; relative to this f
 #                  bound cost_per_hour x timeout_hours; `rjob cost` sums actual hours.
 #   max_hours      longest timeout_hours the host should take; default: no limit. A longer
 #                  job goes elsewhere while another capable host is reachable, else here.
+#   power          "on-demand": a paid cloud host that stops itself when idle and that
+#                  `rjob submit` starts when placement picks it (needs devices, and the
+#                  host in ~/.config/rjob/power.toml; docs/power.md).
 [[hosts]]
 alias = "mac"              # ~/.ssh/config alias, key locked to run-job
 devices = ["cpu", "mps"]   # optional; otherwise learned from `rjob info`
@@ -23,3 +26,4 @@ max_hours = 2              # longer jobs go to the servers; here only when no ot
 alias = "gpuserver"
 devices = ["cpu", "cuda"]
 cost_per_hour = 2.5        # e.g. a rented cloud GPU server
+power = "on-demand"        # stopped when idle; submit starts it

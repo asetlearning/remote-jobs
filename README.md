@@ -24,10 +24,11 @@ project rjob.toml: [[hosts]] mac, gpuserver, ...  → submit places the job; lat
 
 ```bash
 rjob submit examples/pb-smoke            # resolves SHAs, pushes missing commits, queues; prints a job id
+                                         # (starts a stopped power = "on-demand" host it picks; --no-start: never)
 rjob status <id>                         # {"state": "queued|building|running|done|failed|cancelled|timeout|dead", ...}
 rjob logs <id> 50
 rjob wait <id> --interval 60             # exits 0 iff the job finished with state "done"
-rjob fetch <id> [--include '*.json']     # → <runs_dir>/<id>/; re-run to resume or verify
+rjob fetch <id> [--include '*.json']     # → <runs_dir>/<id>/; re-run to resume or verify; --start: start a stopped cloud host
 rjob list [--all] | rjob info | rjob cancel <id>
 rjob hosts                               # capacity, load, cost/h and max_hours of every project host
 rjob cost [--since YYYY-MM-DD] [--host H]  # hours and cost of recorded jobs, per job and per host
@@ -140,6 +141,7 @@ Linux servers currently use the same native backend (per-SHA worktree + uv venv)
 - multi-host: placement by device and free capacity, spill to the next host, recorded hosts, disjoint GPU ids, memory estimates, and compatibility with runners that predate multi-host;
 - autostop (with a fake provider): no stop while jobs run or queue, within the idle window, under a hold or a login; `request-stop`; submits refused while stopping; provider failures; boot restarts queued jobs; the Nebius provider's CLI arguments; the Nebius setup scripts (scoping, re-runs, key handling, least-privilege refusal) against a stub CLI;
 - `rjob power`: status, start (idempotent, waits for the runner), stop through the host, hold, the stopped-host hint, power.toml permissions; `vm/nebius-vm-setup.sh`.
+- Start on submit: a stopped `power = "on-demand"` host is placed and started (not on a dry run or with `--no-start`), a pinned one too; a stopping host is started again after the stop; the `host is stopping` retry; stale stopping markers; `fetch --start`; stale autostop decisions after a boot.
 
 ## Security model
 
