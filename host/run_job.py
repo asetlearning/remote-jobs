@@ -903,7 +903,7 @@ def cmd_info(mode: str = "") -> None:
 def power_info() -> dict:
     """Autostop state for `info`: the runner's own flags plus the watchdog's last decision (if installed)."""
     hold = read_json(POWER / "hold", {}).get("until", 0)
-    booted = mtime(POWER / "booted")
+    booted = max(mtime(POWER / "booted"), os_boot_time())   # before rjob-boot.service has run, too
     return {"stopping": stopping(), "stop_requested": (POWER / "stop_requested").exists(),
             "hold_until": iso(hold) if hold > time.time() else None, "booted": iso(booted) if booted else None,
             "autostop": read_json(AUTOSTOP_STATUS) if AUTOSTOP_STATUS.is_file() else None}

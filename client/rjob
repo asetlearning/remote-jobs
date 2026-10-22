@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import datetime
 import fcntl
 import importlib
@@ -94,10 +95,11 @@ def ssh_cmd(host: str, words: list[str]) -> list[str]:
 
 def remote_failed(host: str, words: list[str], p) -> None:
     msg = f"{words[0]} failed: {p.stderr.decode(errors='replace').strip()}"
-    try:
-        managed = p.returncode == 255 and host in power_hosts(quiet=True)  # ssh could not connect
-        state = provider_state(host) if managed else ""
-    except Exception:  # a broken power.toml must not hide the real error
+    try:  # a broken power.toml (which dies) must not hide or bury the real error
+        with contextlib.redirect_stderr(io.StringIO()):
+            managed = p.returncode == 255 and host in power_hosts(quiet=True)  # ssh could not connect
+            state = provider_state(host) if managed else ""
+    except (Exception, SystemExit):
         managed = False
     if managed:
         msg += (f"\n{host} is a cloud host, now {state}: rjob power start {host} "
@@ -273,14 +275,6 @@ def host_info(host: str) -> dict | None:
         if p.returncode != 2 or b"usage:" not in p.stderr:  # 2 + usage: verb form unknown, retry
             return None
     return None
-
-
-def host_infos(hosts: list[str]) -> dict[str, dict | None]:
-    """host_info for several hosts in parallel (one slow or dead host costs one timeout)."""
-    if not hosts:
-        return {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as ex:
-        return dict(zip(hosts, ex.map(host_info, hosts)))
 
 
 def info_devices(info: dict) -> set[str]:
@@ -638,13 +632,16 @@ def all_hosts(a) -> list[str]:
 def cmd_hosts(a) -> None:
     proj = load_project(a.project)
     print("host\tdevices\tgpu free/total\tcpu free/total\tmem_gb free/total\trunning\tqueued\tcost/h\tmax_hours")
-    for host, info in host_infos(all_hosts(a)).items():
+    hosts = all_hosts(a)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as ex:
+        probed = dict(zip(hosts, ex.map(lambda h: probe(proj, h), hosts)))  # on-demand: cloud API first
+    for host, (info, cold) in probed.items():
         entry = host_entry(proj, host)
         terms = f"\t{entry.get('cost_per_hour', 0):g}\t{entry.get('max_hours', '-')}"
         if info is None:
             state = "unreachable"
-            if host in power_hosts(quiet=True):  # a cloud host: say whether it is just stopped
-                state = f"{provider_state(host).lower()} (rjob power start {host})"
+            if cold or host in power_hosts(quiet=True):  # a cloud host: say whether it is just stopped
+                state = f"{(cold or provider_state(host)).lower()} (rjob power start {host})"
             print(f"{host}\t{state}{chr(9) * 6}{terms}")
             continue
         slots, free = info.get("slots", {}), info.get("free") or {}

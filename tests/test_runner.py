@@ -603,6 +603,11 @@ def rjob_power():
     pconf.write_text(f'[hosts.pw]\nprovider = "../etc"\n')
     r = rp("start", "pw")
     check(r.returncode != 0 and "must name a module" in r.stderr, "provider names are plain module names")
+    down.touch()
+    r = sh(*bare, "status", jid, env=env, check_rc=False)
+    check(r.returncode != 0 and "unreachable pw" in r.stderr and "must name a module" not in r.stderr,
+          "a broken power.toml does not hide the ssh error")
+    down.unlink()
 
 
 def start_on_submit():
