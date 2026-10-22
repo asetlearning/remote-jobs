@@ -14,4 +14,4 @@ provider = "nebius"
 [nebius]
 instance_id = "computeinstance-REPLACE-ME"             # this VM: `nebius compute instance list`
 profile = "rjob-autostop"                              # root's CLI profile for the power-operator service account
-cli = "/root/.nebius/bin/nebius"
+cli = "/root/.nebius/bin/nebius"                      # the installers write the path they find (command -v nebius)

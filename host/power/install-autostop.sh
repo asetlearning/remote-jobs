@@ -36,21 +36,33 @@ if [[ "${1:-}" == --uninstall ]]; then
 fi
 
 install -d -o root -g root -m 700 "$ETC"
+# Where root's nebius CLI is: the installer puts it in /root/.nebius/bin, packages and
+# manual installs often in /usr/local/bin. Use what this shell finds.
+DETECTED_CLI=$(command -v nebius || true)
+[[ -n "$DETECTED_CLI" ]] || { [[ -x /root/.nebius/bin/nebius ]] && DETECTED_CLI=/root/.nebius/bin/nebius; } || true
 if [[ ! -f "$CFG" ]]; then
-  install -o root -g root -m 600 "$HERE/autostop.toml.example" "$CFG"
-  echo "wrote $CFG from the template: fill in worker, instance_id and profile, then run again" >&2
+  sed "s|^cli = .*|cli = \"${DETECTED_CLI:-/root/.nebius/bin/nebius}\"|" "$HERE/autostop.toml.example" > "$CFG.tmp"
+  install -o root -g root -m 600 "$CFG.tmp" "$CFG"
+  rm -f "$CFG.tmp"
+  echo "wrote $CFG from the template (cli = ${DETECTED_CLI:-not found, check it}): fill in worker, instance_id and profile, then run again" >&2
   exit 1
 fi
 chown root:root "$CFG"
 chmod 600 "$CFG"
 
 # Values for the boot unit, read with the system Python (root never runs worker-owned code).
-read -r WORKER PY RUNNER ROOT < <(/usr/bin/python3 - "$CFG" <<'EOF'
+read -r WORKER PY RUNNER ROOT CLI < <(/usr/bin/python3 - "$CFG" <<'EOF'
 import sys, tomllib
 c = tomllib.load(open(sys.argv[1], "rb"))
-print(c["worker"], c["runner_python"], c["runner"], c["rjob_root"])
+print(c["worker"], c["runner_python"], c["runner"], c["rjob_root"], c.get(c["provider"], {}).get("cli", "-"))
 EOF
 )
+# The provider CLI the watchdog will call must exist (a wrong path would only show up
+# as an error in the status file, with the host never stopping).
+if [[ "$CLI" != - && ! -x "$CLI" ]]; then
+  echo "cli = \"$CLI\" in $CFG is not an executable${DETECTED_CLI:+; found $DETECTED_CLI: set cli = \"$DETECTED_CLI\"}" >&2
+  exit 1
+fi
 id "$WORKER" >/dev/null || { echo "no such user: $WORKER" >&2; exit 1; }
 if grep -q REPLACE-ME "$CFG"; then
   echo "$CFG still has placeholder values" >&2
