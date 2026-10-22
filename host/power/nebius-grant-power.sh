@@ -1,26 +1,36 @@
 #!/bin/bash
-# nebius-grant-power.sh — step 1 of 2 to enable autostop on a Nebius VM.
+# nebius-grant-power.sh — grant power operations on one Nebius VM to a service account.
 # Run on YOUR LAPTOP, where the Nebius CLI is logged in as a tenant admin.
-# Step 2 is nebius-setup-profile.sh, run as root on the VM itself.
 #
-# It creates (or reuses, when re-run) everything the VM needs to stop itself:
-#   service account  rjob-autostop-<suffix>   the identity the VM's watchdog acts as
-#   group            rjob-power-<suffix>      roles are granted to groups, not accounts
+# Two uses:
+#   --for host (default)  the cloud VM's own watchdog, so it can stop itself when idle.
+#                         Next step: nebius-setup-profile.sh, as root on that VM.
+#   --for vm              the agents' VM, so `rjob power start` can start that cloud VM.
+#                         One account for all cloud VMs: run once per cloud VM, with
+#                         --no-key after the first. Next step: vm/nebius-vm-setup.sh.
+#
+# It creates (or reuses, when re-run):
+#   service account  rjob-autostop-<suffix>   (--for vm: rjob-vm-power[-<suffix>])
+#   group            rjob-power-<suffix>      (--for vm: rjob-vm-power[-<suffix>]);
+#                                             roles are granted to groups, not accounts
 #   membership       the account in the group
 #   access permit    compute.instance-power-operator on THIS INSTANCE ONLY
 #                    (view / start / stop / view operations; nothing else, no other VM)
 #   authorized key   a key pair: the public half is uploaded to Nebius, the private half
-#                    is written to a local credentials file (a SECRET) for the VM
+#                    is written to a local credentials file (a SECRET); skipped with --no-key
 #
 #   bash nebius-grant-power.sh --tenant-id ID --project-id ID \
-#        (--instance-name NAME | --instance-id ID) [--suffix S] [--expires-at RFC3339] \
-#        [--out DIR] [--admin-profile PROFILE]
+#        (--instance-name NAME | --instance-id ID) [--for host|vm] [--suffix S] \
+#        [--expires-at RFC3339] [--no-key] [--out DIR] [--admin-profile PROFILE]
 #
 #   --tenant-id      tenant that owns the group (Nebius console: tenant settings)
 #   --project-id     project of the VM; the service account is created there
 #   --instance-name  VM name as shown in the console, or
 #   --instance-id    VM id (computeinstance-...)
-#   --suffix         names the account and group; default: the instance name (or id)
+#   --for            host (default): for the cloud VM's watchdog; vm: for the agents' VM
+#   --suffix         names the account and group; default: the instance name (--for host),
+#                    none (--for vm)
+#   --no-key         grant only; keep using the key made earlier (adding a VM to --for vm)
 #   --expires-at     key expiry, e.g. 2027-10-22T00:00:00Z. After it, the VM can no longer
 #                    stop itself: it stays up and reports the error (never loses jobs)
 #   --out            where to write the credentials file; default: current directory
@@ -39,6 +49,7 @@ die() { echo "error: $*" >&2; exit 1; }
 usage() { sed -n '/^#   bash nebius-grant-power.sh/,/^#   --admin-profile/p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 TENANT_ID="" PROJECT_ID="" INSTANCE_NAME="" INSTANCE_ID="" SUFFIX="" EXPIRES_AT="" OUT="." ADMIN_PROFILE=""
+FOR=host NO_KEY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --tenant-id) TENANT_ID="${2:-}"; shift 2 ;;
@@ -46,6 +57,8 @@ while [ $# -gt 0 ]; do
     --instance-name) INSTANCE_NAME="${2:-}"; shift 2 ;;
     --instance-id) INSTANCE_ID="${2:-}"; shift 2 ;;
     --suffix) SUFFIX="${2:-}"; shift 2 ;;
+    --for) FOR="${2:-}"; shift 2 ;;
+    --no-key) NO_KEY=1; shift ;;
     --expires-at) EXPIRES_AT="${2:-}"; shift 2 ;;
     --out) OUT="${2:-}"; shift 2 ;;
     --admin-profile) ADMIN_PROFILE="${2:-}"; shift 2 ;;
@@ -67,6 +80,7 @@ NAME_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$'
 [ -z "$ADMIN_PROFILE" ] || [[ "$ADMIN_PROFILE" =~ $NAME_RE ]] || die "bad --admin-profile"
 [ -z "$EXPIRES_AT" ] || [[ "$EXPIRES_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+(Z|[+-][0-9:]+)$ ]] || die "bad --expires-at (RFC 3339, e.g. 2027-10-22T00:00:00Z)"
 [ -d "$OUT" ] || die "no such directory: $OUT"
+[ "$FOR" = host ] || [ "$FOR" = vm ] || die "--for must be host or vm"
 command -v nebius >/dev/null || die "nebius CLI not found on PATH"
 
 # Every call runs as you (the admin), with your profile if given.
@@ -97,10 +111,17 @@ fi
 [[ "$INSTANCE_ID" =~ $ID_RE ]] || die "unexpected instance id: $INSTANCE_ID"
 SHOWN=$(nb compute instance get --id "$INSTANCE_ID" --format 'jsonpath={.metadata.name}' | tr -d '"')
 echo "   $INSTANCE_ID ($SHOWN)"
-[ -n "$SUFFIX" ] || SUFFIX="${INSTANCE_NAME:-$SHOWN}"
-SUFFIX=$(printf '%s' "${SUFFIX:-$INSTANCE_ID}" | tr 'A-Z_.' 'a-z--' | tr -cd 'a-z0-9-' | cut -c1-40)
-SA_NAME="rjob-autostop-$SUFFIX"
-GROUP_NAME="rjob-power-$SUFFIX"
+if [ "$FOR" = host ]; then
+  [ -n "$SUFFIX" ] || SUFFIX="${INSTANCE_NAME:-$SHOWN}"
+  SUFFIX=$(printf '%s' "${SUFFIX:-$INSTANCE_ID}" | tr 'A-Z_.' 'a-z--' | tr -cd 'a-z0-9-' | cut -c1-40)
+  SA_NAME="rjob-autostop-$SUFFIX"
+  GROUP_NAME="rjob-power-$SUFFIX"
+else
+  # The agents' VM: one account and group for every cloud VM it may start.
+  SUFFIX=$(printf '%s' "$SUFFIX" | tr 'A-Z_.' 'a-z--' | tr -cd 'a-z0-9-' | cut -c1-40)
+  SA_NAME="rjob-vm-power${SUFFIX:+-$SUFFIX}"
+  GROUP_NAME="$SA_NAME"
+fi
 
 # 2. The service account: a non-human identity in the VM's project. It has no rights of
 #    its own; it gets them through the group in steps 3-4.
@@ -114,8 +135,9 @@ else
   echo "   reusing $SA_ID"
 fi
 
-# 3. A group just for this VM's power operator, with the account as its only member.
-#    One group per VM keeps the grant from step 4 from reaching any other machine.
+# 3. A group with the account as its only member. --for host: one group per VM, so the
+#    grant from step 4 reaches no other machine. --for vm: one group holding one permit
+#    per cloud VM the agents may start.
 echo "== 3. group $GROUP_NAME"
 GROUP_ID=$(id_of iam group get-by-name --parent-id "$TENANT_ID" --name "$GROUP_NAME")
 if [ -z "$GROUP_ID" ]; then
@@ -139,6 +161,14 @@ create_or_exists iam access-permit create --parent-id "$GROUP_ID" --resource-id 
 #    writes the private key plus ids into a JSON credentials file. That file is the
 #    secret the VM authenticates with: written with mode 600, moved to the VM in step 6,
 #    then deleted here.
+if [ "$NO_KEY" = 1 ]; then
+  echo "== 5. authorized key: skipped (--no-key); the existing key of $SA_NAME now also covers $INSTANCE_ID"
+  if [ "$FOR" = vm ]; then
+    printf '\n== Done. On the agents VM, add the host to power.toml:\n     bash vm/nebius-vm-setup.sh --alias <ssh-alias> --project-id %s --instance-id %s\n' \
+      "$PROJECT_ID" "$INSTANCE_ID"
+  fi
+  exit 0
+fi
 echo "== 5. authorized key"
 CRED="$OUT/$SA_NAME.json"
 [ ! -e "$CRED" ] || die "$CRED exists: move it to the VM (step 6) or delete it, then re-run"
@@ -151,6 +181,19 @@ chmod 600 "$CRED"
 echo "   wrote $CRED${EXPIRES_AT:+ (expires $EXPIRES_AT)}"
 
 # 6. What to do next, with every value filled in.
+if [ "$FOR" = vm ]; then
+  cat <<EOF
+
+== Done on the laptop. Next, on the agents' VM (as its usual user, not root):
+1. Copy the credentials file (it is a secret), then delete it here:
+     scp $CRED <you>@<agents-vm>:/tmp/
+     rm -P $CRED        # macOS; on Linux: shred -u $CRED
+2. On the agents' VM, from the remote-jobs checkout:
+     bash vm/nebius-vm-setup.sh --credentials /tmp/$SA_NAME.json \\
+       --project-id $PROJECT_ID --instance-id $INSTANCE_ID --alias <ssh-alias>
+EOF
+  exit 0
+fi
 cat <<EOF
 
 == Done on the laptop. Next, on the VM:

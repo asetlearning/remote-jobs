@@ -11,6 +11,7 @@ This repo is the bridge from the sandboxed agent VM to remote compute hosts. Kee
 | `host/install.sh` | Host setup, run as the worker account |
 | `host/power/` | Autostop for paid cloud hosts: `rjob-autostop` (root, systemd timer), `providers/` (`nebius`, `fake`), units, `install-autostop.sh` (root), per-instance Nebius setup `nebius-grant-power.sh` (laptop, admin) and `nebius-setup-profile.sh` (VM, root). See `docs/power.md` |
 | `client/rjob` | The VM client: project host lists (`rjob.toml`, with optional `cost_per_hour` and `max_hours` per host), placement, recorded hosts, `rjob cost`; stdlib only |
+| `vm/nebius-vm-setup.sh` | Agents' VM: Nebius key and profile for `rjob power`, `~/.config/rjob/power.toml` |
 | `client/capjob` | Local runs on the VM inside a memory/CPU cap (systemd user scope, oom_score_adj 1000); when the cap kills the job, it falls back to `rjob submit`. Stdlib only |
 | `examples/` | Job specs: `smoke-device`, `smoke-device-cuda`, `b25-build`, `pb-smoke`; `project-rjob.toml` (per-project host list) |
 | `tests/test_runner.py` | End-to-end test with a fake ssh; no real host needed |
@@ -23,6 +24,7 @@ This repo is the bridge from the sandboxed agent VM to remote compute hosts. Kee
    - Over SSH, only the verbs in `SSH_VERBS` are reachable, with regex-validated args.
    - Internal verbs (`_supervise`, `_tick`, `_power-check`, `_power-abort`, `_power-boot`) must stay unreachable over `--ssh`.
    - The root watchdog (`host/power/rjob-autostop`) never parses worker-owned files or runs worker code as root; it asks the runner through `runuser` as the worker. Its provider key may only start and stop its own instance.
+   - The client calls only a provider's `state` and `start`; stops go through the runner's `request-stop` (`rjob power stop`), never a provider `stop` from the VM.
    - Autostop never stops a busy host: `_power-check` decides under `flock("scheduler")` and sets `power/stopping`, which `cmd_submit` checks under the same lock.
    - Never `shell=True`, and never interpolate client input into a shell.
    - Bundles may contain only `refs/rjob/<sha>`, and tar extraction uses `filter="data"`.
