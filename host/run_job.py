@@ -23,6 +23,14 @@ Layout under $RJOB_ROOT (default ~/rjob):
     data/<sha256>          content-addressed inputs (put-data)
     jobs/<id>/             job.json, bundle/, work/, state.json, log.txt, provenance.json, manifest.json
     locks/                 flock files
+    power/                 autostop state shared with the root watchdog (host/power/rjob-autostop):
+                           last_activity, booted, hold, stop_requested, stopping
+
+Autostop (paid cloud hosts): the root watchdog runs `run_job.py _power-check` as this
+account. Under the scheduler lock it decides whether the host may stop (no running or
+queued jobs, idle long enough, no hold) and, if so, writes power/stopping, which makes
+`submit` refuse until the next boot (`_power-boot`, run by a systemd unit, clears it and
+starts queued jobs). The internal verbs are refused on the --ssh path.
 
 Python 3.11+ standard library only.
 """
@@ -78,6 +86,13 @@ RE_RELPATH = re.compile(r"^(?!/)(?!.*(^|/)\.\.(/|$))[A-Za-z0-9._/+=@-]{1,400}$")
 TERMINAL = {"done", "failed", "cancelled", "timeout", "dead"}
 ACTIVE = {"building", "running"}
 
+POWER = ROOT / "power"
+AUTOSTOP_STATUS = Path(os.environ.get("RJOB_AUTOSTOP_STATUS", "/var/lib/rjob-power/status.json"))
+AUTOSTOP_BIN = Path(os.environ.get("RJOB_AUTOSTOP_BIN", "/usr/local/lib/rjob-power/rjob-autostop"))
+NOT_ACTIVITY = {"info", "status", "list"}   # probes and polls do not keep a host awake
+HOLD_MAX_HOURS = 12
+RE_HOURS = re.compile(r"^[0-9]{1,2}(\.[0-9]{1,2})?$")
+
 
 class UserError(Exception):
     """Bad request from the client; printed to stderr, exit 2."""
@@ -110,7 +125,7 @@ def host_devices(cfg: dict) -> list[str]:
 
 
 def ensure_layout() -> None:
-    for sub in ("mirrors", "builds", "data", "jobs", "locks"):
+    for sub in ("mirrors", "builds", "data", "jobs", "locks", "power"):
         (ROOT / sub).mkdir(parents=True, exist_ok=True)
 
 
@@ -148,6 +163,17 @@ def sha256_file(path: Path) -> str:
 
 def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def iso(t: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t))
+
+
+def mtime(path: Path) -> float:
+    try:
+        return os.lstat(path).st_mtime
+    except FileNotFoundError:
+        return 0.0
 
 
 def pid_alive(pid: int) -> bool:
@@ -719,9 +745,13 @@ def cmd_submit() -> None:
     except Exception:
         shutil.rmtree(d, ignore_errors=True)
         raise
-    write_json(d / "job.json", job)
-    write_json(d / "state.json", {"state": "queued", "submitted": now(), "name": job.get("name", "")})
-    (d / "log.txt").touch()
+    with flock("scheduler"):  # the autostop check holds it too: a job is queued before or refused after
+        if (POWER / "stopping").exists():
+            shutil.rmtree(d, ignore_errors=True)
+            raise UserError("host is stopping; start it again, then resubmit")
+        write_json(d / "job.json", job)
+        write_json(d / "state.json", {"state": "queued", "submitted": now(), "name": job.get("name", "")})
+        (d / "log.txt").touch()
     tick()
     print(job_id)
 
@@ -843,13 +873,93 @@ def cmd_info(mode: str = "") -> None:
             "idle": not u["active"],
             "gpu_ids": pool, "devices": host_devices(cfg),
             "running": [d.name for d in u["active"]], "queued": [d.name for d in u["queued"]],
-            "queue_len": len(u["queued"])}
+            "queue_len": len(u["queued"]), "power": power_info()}
     if mode != "brief":
         info["gpus"] = nvidia_gpus()
         info["builds"] = {p.name: (p / "state").read_text().strip() for p in sorted((ROOT / "builds").iterdir())
                           if (p / "state").exists()}
         info["default_python"] = probe_env(cfg["python"], dict(os.environ))
     print(json.dumps(info, indent=2))
+
+
+def power_info() -> dict:
+    """Autostop state for `info`: the runner's own flags plus the watchdog's last decision (if installed)."""
+    hold = read_json(POWER / "hold", {}).get("until", 0)
+    return {"stopping": (POWER / "stopping").exists(), "stop_requested": (POWER / "stop_requested").exists(),
+            "hold_until": iso(hold) if hold > time.time() else None,
+            "autostop": read_json(AUTOSTOP_STATUS) if AUTOSTOP_STATUS.is_file() else None}
+
+
+def cmd_hold(hours: str) -> None:
+    """hold <hours>: keep the host up (no autostop) for up to 12 h; 0 clears the hold."""
+    if not RE_HOURS.match(hours) or float(hours) > HOLD_MAX_HOURS:
+        raise UserError(f"usage: hold <hours>, 0..{HOLD_MAX_HOURS}")
+    if float(hours) == 0:
+        (POWER / "hold").unlink(missing_ok=True)
+        print("hold cleared")
+        return
+    until = time.time() + float(hours) * 3600
+    write_json(POWER / "hold", {"until": until, "set": now()})
+    print(f"hold until {iso(until)}")
+
+
+def cmd_request_stop(arg: str = "") -> None:
+    """request-stop [cancel]: stop the host as soon as it is idle, skipping the idle window and any hold."""
+    if arg not in ("", "cancel"):
+        raise UserError("usage: request-stop [cancel]")
+    if not AUTOSTOP_BIN.exists():
+        raise UserError("this host has no autostop (docs/power.md); nothing would act on the request")
+    if arg == "cancel":
+        (POWER / "stop_requested").unlink(missing_ok=True)
+        print("stop request cancelled")
+        return
+    (POWER / "stop_requested").write_text(now() + "\n")
+    u = usage(config())
+    busy = f"{len(u['active'])} running, {len(u['queued'])} queued"
+    print(f"stop requested; the host stops at the next autostop check once idle ({busy})")
+
+
+def power_check(idle_minutes: str, commit: str) -> None:
+    """Internal (root watchdog, run as this account): may the host stop now? Prints a JSON
+    decision. With commit = 1 an eligible host gets power/stopping, under the scheduler lock."""
+    idle_s = float(idle_minutes) * 60
+    with flock("scheduler"):
+        u = usage(config())
+        t = time.time()
+        last = max([mtime(POWER / "last_activity"), mtime(POWER / "booted")]
+                   + [mtime(d / "state.json") for d in all_jobs()])
+        hold = read_json(POWER / "hold", {}).get("until", 0)
+        requested = (POWER / "stop_requested").exists()
+        busy = len(u["active"]) + len(u["queued"])
+        r = {"running": len(u["active"]), "queued": len(u["queued"]), "idle_since": iso(last) if last else None,
+             "hold_until": iso(hold) if hold > t else None, "stop_requested": requested, "eligible": False,
+             "stop_at": None if busy else iso(max(last + idle_s, hold) if not requested else t)}
+        if busy:
+            r["reason"] = f"busy: {r['running']} running, {r['queued']} queued"
+        elif requested:
+            r["eligible"], r["reason"] = True, "stop requested"
+        elif hold > t:
+            r["reason"] = f"hold until {r['hold_until']}"
+        elif t - last < idle_s:
+            r["reason"] = f"idle {(t - last) / 60:.0f} of {float(idle_minutes):g} min"
+        else:
+            r["eligible"], r["reason"] = True, f"idle {(t - last) / 60:.0f} min"
+        if r["eligible"] and commit == "1":
+            (POWER / "stopping").write_text(now() + "\n")
+    print(json.dumps(r))
+
+
+def power_abort() -> None:
+    """Internal: the provider stop failed; accept submits again."""
+    (POWER / "stopping").unlink(missing_ok=True)
+
+
+def power_boot() -> None:
+    """Internal (systemd unit at boot): clear the stop flags, restart the idle clock, start queued jobs."""
+    for name in ("stopping", "stop_requested"):
+        (POWER / name).unlink(missing_ok=True)
+    (POWER / "booted").write_text(now() + "\n")
+    tick()
 
 
 def cmd_cleanup(target: str, arg: str = "") -> None:
@@ -893,7 +1003,10 @@ SSH_VERBS = {
     "list": (cmd_list, 0, 0), "cancel": (cmd_cancel, 1, 1), "manifest": (cmd_manifest, 1, 1),
     "provenance": (cmd_provenance, 1, 1), "fetch": (cmd_fetch, 1, 1), "info": (cmd_info, 0, 1),
     "cleanup": (cmd_cleanup, 1, 2), "tick": (lambda: tick(), 0, 0),
+    "hold": (cmd_hold, 1, 1), "request-stop": (cmd_request_stop, 0, 1),
 }
+INTERNAL_VERBS = {"_power-check": (power_check, 2, 2), "_power-abort": (power_abort, 0, 0),
+                  "_power-boot": (power_boot, 0, 0)}
 USAGE = "usage: " + " | ".join(sorted(SSH_VERBS))
 
 
@@ -911,6 +1024,13 @@ def main(argv: list[str]) -> int:
         if argv and argv[0] == "_tick":
             tick()
             return 0
+        if argv and argv[0] in INTERNAL_VERBS:
+            fn, lo, hi = INTERNAL_VERBS[argv[0]]
+            if not lo <= len(argv) - 1 <= hi:
+                print(f"usage: {argv[0]}", file=sys.stderr)
+                return 2
+            fn(*argv[1:])
+            return 0
         words = argv
     if not words or words[0] not in SSH_VERBS:
         print(USAGE, file=sys.stderr)
@@ -920,6 +1040,8 @@ def main(argv: list[str]) -> int:
     if not lo <= len(args) <= hi:
         print(USAGE, file=sys.stderr)
         return 2
+    if words[0] not in NOT_ACTIVITY:
+        (POWER / "last_activity").touch()
     try:
         fn(*args)
     except UserError as exc:

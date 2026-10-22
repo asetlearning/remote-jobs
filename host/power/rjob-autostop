@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""rjob-autostop — stop this cloud VM through the provider API when the runner is idle.
+
+Runs as root from a systemd timer (rjob-autostop.timer, every 5 min) on a paid host.
+Shutting the VM down from inside does not help: Nebius treats a guest shutdown as a
+failure, reboots the VM and keeps billing. So the stop goes through the provider API,
+with a credential that may only start/stop this one instance (Nebius:
+compute.instance-power-operator, access permit scoped to the instance).
+
+Each run:
+  1. Skips the stop while anyone is logged in interactively (`who`).
+  2. Asks the runner, as the worker account, whether the host may stop
+     (`run_job.py _power-check`): no running or queued jobs, no runner activity and no
+     job change for idle_minutes, no hold, or an explicit `request-stop`. The runner
+     decides under its scheduler lock and, when eligible, sets power/stopping, so a
+     submit cannot slip in before the stop.
+  3. Stops the instance (asynchronously) if the provider reports it RUNNING. If the
+     provider call fails, it clears power/stopping (`_power-abort`) and retries next run.
+  4. Writes its decision to the status file, which the runner's `info` reports.
+
+Every failure leaves the host running: it costs money, never jobs.
+Root never parses worker-owned files itself; all of that runs as the worker.
+
+    rjob-autostop              check, and stop when eligible
+    rjob-autostop --dry-run    check and print the decision; never stops
+    rjob-autostop --state      print the provider's instance state (tests the credential)
+
+Config: /etc/rjob-power/autostop.toml ($RJOB_AUTOSTOP_CONFIG); see autostop.toml.example.
+Status: /var/lib/rjob-power/status.json ($RJOB_AUTOSTOP_STATUS).
+Python 3.11+ standard library only.
+"""
+# Created by: Alex Myasnikov
+# Date: October 22, 2026
+from __future__ import annotations
+
+import importlib
+import json
+import os
+import pwd
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))  # providers/ lives next to this script (root-owned install dir)
+
+CONFIG = Path(os.environ.get("RJOB_AUTOSTOP_CONFIG", "/etc/rjob-power/autostop.toml"))
+STATUS = Path(os.environ.get("RJOB_AUTOSTOP_STATUS", "/var/lib/rjob-power/status.json"))
+REQUIRED = ("worker", "runner_python", "runner", "rjob_root", "provider")
+
+
+def now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def load_config() -> dict:
+    cfg = tomllib.loads(CONFIG.read_text())
+    missing = [k for k in REQUIRED if k not in cfg]
+    if missing:
+        sys.exit(f"{CONFIG}: missing {', '.join(missing)}")
+    cfg.setdefault("idle_minutes", 30)
+    cfg.setdefault("logins_cmd", ["who"])
+    return cfg
+
+
+def provider(cfg: dict):
+    mod = importlib.import_module(f"providers.{cfg['provider']}")
+    return mod, dict(cfg.get(cfg["provider"], {}))
+
+
+def as_worker(cfg: dict, *args: str) -> str:
+    """Run the runner's internal verb as the worker account and return its stdout."""
+    cmd = ["env", f"RJOB_ROOT={cfg['rjob_root']}", f"RJOB_AUTOSTOP_STATUS={STATUS}",
+           cfg["runner_python"], cfg["runner"], *args]
+    if os.geteuid() == 0:  # runuser keeps root's environment: give the worker its own HOME
+        cmd = ["runuser", "-u", cfg["worker"], "--", "env", f"HOME={pwd.getpwnam(cfg['worker']).pw_dir}"] + cmd[1:]
+    p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        raise RuntimeError(f"runner {args[0]} failed ({p.returncode}): {p.stderr.strip()[-300:]}")
+    return p.stdout
+
+
+def logins(cfg: dict) -> list[str]:
+    p = subprocess.run(cfg["logins_cmd"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    return [line for line in p.stdout.splitlines() if line.strip()]
+
+
+def write_status(status: dict) -> None:
+    STATUS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATUS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(status, indent=2, sort_keys=True))
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STATUS)
+
+
+def check(cfg: dict, dry_run: bool) -> dict:
+    mod, pcfg = provider(cfg)
+    status = {"checked": now(), "idle_minutes": cfg["idle_minutes"], "provider": cfg["provider"],
+              "dry_run": dry_run, "error": None}
+    committed = False
+    try:
+        who = logins(cfg)
+        commit = not (who or dry_run)
+        dec = json.loads(as_worker(cfg, "_power-check", str(cfg["idle_minutes"]), "1" if commit else "0"))
+        status.update(dec)
+        committed = commit and dec["eligible"]
+        if who:
+            status["decision"] = f"wait: {len(who)} interactive login(s)"
+        elif not dec["eligible"]:
+            status["decision"] = f"wait: {dec['reason']}"
+        elif dry_run:
+            status["decision"] = f"would stop: {dec['reason']}"
+        else:
+            state = mod.state(pcfg)
+            status["instance_state"] = state
+            if state != "RUNNING":
+                status["decision"] = f"no action: instance is {state}"
+                if state not in ("STOPPING", "STOPPED"):
+                    as_worker(cfg, "_power-abort")
+            else:
+                status["decision"] = f"stopping: {dec['reason']}"
+                write_status(status)  # the stop may end this process with the VM
+                mod.stop(pcfg)
+                status["decision"] = f"stop sent: {dec['reason']}"
+    except Exception as exc:  # any failure: keep the host up and accepting jobs, retry next run
+        status["error"] = f"{type(exc).__name__}: {exc}"
+        status["decision"] = "error: host stays up"
+        if committed:
+            try:
+                as_worker(cfg, "_power-abort")
+            except Exception as exc2:
+                status["error"] += f"; abort failed: {exc2}"
+    if not dry_run:
+        write_status(status)
+    return status
+
+
+def main(argv: list[str]) -> int:
+    if argv not in ([], ["--dry-run"], ["--state"]):
+        print(__doc__, file=sys.stderr)
+        return 2
+    cfg = load_config()
+    if argv == ["--state"]:
+        mod, pcfg = provider(cfg)
+        print(mod.state(pcfg))
+        return 0
+    status = check(cfg, dry_run=argv == ["--dry-run"])
+    print(json.dumps(status, indent=2, sort_keys=True))
+    return 1 if status["error"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

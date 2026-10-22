@@ -1,0 +1,16 @@
+# Installed by install-autostop.sh (@WORKER@, @PYTHON@, @RUNNER@ and @ROOT@ filled in).
+# At boot, as the worker: clear the stop flags, restart the idle clock and start jobs
+# that were queued when the host went down.
+[Unit]
+Description=remote-jobs: clear autostop flags and start queued jobs after boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@WORKER@
+Environment=RJOB_ROOT=@ROOT@
+ExecStart=@PYTHON@ @RUNNER@ _power-boot
+
+[Install]
+WantedBy=multi-user.target

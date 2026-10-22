@@ -9,18 +9,21 @@ This repo is the bridge from the sandboxed agent VM to remote compute hosts. Kee
 | `host/run_job.py` | The whole host side: SSH verb dispatch, git mirrors, per-SHA builds, scheduler (GPU ids, CPU slots, mem_gb), supervisor, manifest, fetch. Stdlib only, Python 3.11+ |
 | `host/run-job` | The forced-command shim that `authorized_keys` points at |
 | `host/install.sh` | Host setup, run as the worker account |
+| `host/power/` | Autostop for paid cloud hosts: `rjob-autostop` (root, systemd timer), `providers/` (`nebius`, `fake`), units, `install-autostop.sh` (root). See `docs/power.md` |
 | `client/rjob` | The VM client: project host lists (`rjob.toml`, with optional `cost_per_hour` and `max_hours` per host), placement, recorded hosts, `rjob cost`; stdlib only |
 | `client/capjob` | Local runs on the VM inside a memory/CPU cap (systemd user scope, oom_score_adj 1000); when the cap kills the job, it falls back to `rjob submit`. Stdlib only |
 | `examples/` | Job specs: `smoke-device`, `smoke-device-cuda`, `b25-build`, `pb-smoke`; `project-rjob.toml` (per-project host list) |
 | `tests/test_runner.py` | End-to-end test with a fake ssh; no real host needed |
 | `tests/test_capjob.py` | capjob: cap, exit codes, fallback paths, with a stub rjob (needs a systemd user session) |
-| `docs/` | `mac-setup.md`, `server-setup.md` (Linux/CUDA), `execution-policy.md` (local vs remote; backends) |
+| `docs/` | `mac-setup.md`, `server-setup.md` (Linux/CUDA), `power.md` (autostop on paid hosts), `execution-policy.md` (local vs remote; backends) |
 
 ## Invariants (do not break)
 
 1. **Security boundary.**
    - Over SSH, only the verbs in `SSH_VERBS` are reachable, with regex-validated args.
-   - Internal verbs (`_supervise`, `_tick`) must stay unreachable over `--ssh`.
+   - Internal verbs (`_supervise`, `_tick`, `_power-check`, `_power-abort`, `_power-boot`) must stay unreachable over `--ssh`.
+   - The root watchdog (`host/power/rjob-autostop`) never parses worker-owned files or runs worker code as root; it asks the runner through `runuser` as the worker. Its provider key may only start and stop its own instance.
+   - Autostop never stops a busy host: `_power-check` decides under `flock("scheduler")` and sets `power/stopping`, which `cmd_submit` checks under the same lock.
    - Never `shell=True`, and never interpolate client input into a shell.
    - Bundles may contain only `refs/rjob/<sha>`, and tar extraction uses `filter="data"`.
 2. **Exact provenance.**

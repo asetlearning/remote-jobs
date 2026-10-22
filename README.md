@@ -121,6 +121,7 @@ Linux servers currently use the same native backend (per-SHA worktree + uv venv)
 
 - Mac: [docs/mac-setup.md](docs/mac-setup.md) covers the worker account, the locked SSH key and the VM client.
 - Linux server: [docs/server-setup.md](docs/server-setup.md).
+- Paid cloud host: also [docs/power.md](docs/power.md), so the host stops itself (through the provider API) after 30 idle minutes.
 - Then add the host's alias to the project's `rjob.toml`.
 
 ## Tests
@@ -135,7 +136,8 @@ Linux servers currently use the same native backend (per-SHA worktree + uv venv)
 - resumable fetch;
 - provenance;
 - rejection of hostile commands;
-- multi-host: placement by device and free capacity, spill to the next host, recorded hosts, disjoint GPU ids, memory estimates, and compatibility with runners that predate multi-host.
+- multi-host: placement by device and free capacity, spill to the next host, recorded hosts, disjoint GPU ids, memory estimates, and compatibility with runners that predate multi-host;
+- autostop (with a fake provider): no stop while jobs run or queue, within the idle window, under a hold or a login; `request-stop`; submits refused while stopping; provider failures; boot restarts queued jobs; the Nebius provider's CLI arguments.
 
 ## Security model
 
@@ -143,4 +145,5 @@ Linux servers currently use the same native backend (per-SHA worktree + uv venv)
 - **Command parsing.** The client's command line is parsed against a whitelist of verbs and argument regexes, and is never executed. There is no shell, scp, rsync or forwarding.
 - **Code transfer.** Code arrives as git bundles, which must verify and may contain only `refs/rjob/<sha>`.
 - **Archive extraction.** Tar extraction uses Python's `data` filter, which rejects absolute paths, `..` and links outside the tree.
+- **Autostop (paid hosts).** The root watchdog holds a provider key that may only start and stop its own instance, in a file the worker can't read. It never parses worker-owned files: it asks the runner, run as the worker. The internal `_power-*` verbs are unreachable over SSH. See [docs/power.md](docs/power.md).
 - **Residual risk.** Job code is arbitrary and runs as the worker account, which must hold nothing of value (no Apple ID, no keys, no personal files).
