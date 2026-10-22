@@ -137,7 +137,7 @@ Linux servers currently use the same native backend (per-SHA worktree + uv venv)
 - provenance;
 - rejection of hostile commands;
 - multi-host: placement by device and free capacity, spill to the next host, recorded hosts, disjoint GPU ids, memory estimates, and compatibility with runners that predate multi-host;
-- autostop (with a fake provider): no stop while jobs run or queue, within the idle window, under a hold or a login; `request-stop`; submits refused while stopping; provider failures; boot restarts queued jobs; the Nebius provider's CLI arguments.
+- autostop (with a fake provider): no stop while jobs run or queue, within the idle window, under a hold or a login; `request-stop`; submits refused while stopping; provider failures; boot restarts queued jobs; the Nebius provider's CLI arguments; the Nebius setup scripts (scoping, re-runs, key handling, least-privilege refusal) against a stub CLI.
 
 ## Security model
 

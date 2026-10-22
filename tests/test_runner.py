@@ -521,6 +521,99 @@ def autostop():
     check(not bad, f"internal power verbs and bad arguments rejected over ssh {bad}")
 
 
+def nebius_setup_scripts():
+    """host/power/nebius-grant-power.sh (laptop) and nebius-setup-profile.sh (VM) against a stub CLI."""
+    import getpass
+    d = TMP / "nb"
+    (d / "bin").mkdir(parents=True)
+    st = d / "state"
+    st.mkdir()
+    log = d / "argv.log"
+    stub = d / "bin/nebius"
+    stub.write_text(f"""#!/bin/bash
+echo "$*" >> {log}
+S={st}
+arg() {{ local k="$1"; shift; while [ $# -gt 0 ]; do [ "$1" = "$k" ] && {{ echo "$2"; return; }}; shift; done; }}
+once() {{ if [ -e "$S/$1" ]; then echo "ALREADY_EXISTS: $1" >&2; exit 1; fi; touch "$S/$1"; }}
+case "$1 $2 $3" in
+  "compute instance get-by-name") echo computeinstance-e00test ;;
+  "compute instance get") case "$*" in *metadata.name*) echo '"testvm"' ;; *) echo '"'"${{STUB_STATE:-RUNNING}}"'"' ;; esac ;;
+  "iam service-account get-by-name") [ -e "$S/sa" ] && echo serviceaccount-e00sa || exit 1 ;;
+  "iam service-account create") touch "$S/sa"; echo serviceaccount-e00sa ;;
+  "iam service-account list") exit "${{STUB_IAM_RC:-1}}" ;;
+  "iam group get-by-name") [ -e "$S/group" ] && echo group-e00grp || exit 1 ;;
+  "iam group create") touch "$S/group"; echo group-e00grp ;;
+  "iam group-membership create") once member ;;
+  "iam access-permit create") once permit ;;
+  "iam auth-public-key generate") echo '{{"subject-credentials": "secret"}}' > "$(arg --output "$@")" ;;
+  *) case "$1 $2" in
+       "profile list") cat "$S/profiles" 2>/dev/null ;;
+       "profile create") arg --profile "$@" >> "$S/profiles" ;;
+       *) echo "stub: unexpected $*" >&2; exit 3 ;;
+     esac ;;
+esac
+""")
+    stub.chmod(0o755)
+    env = dict(os.environ, PATH=f"{d / 'bin'}:{os.environ['PATH']}")
+    out = d / "out"
+    out.mkdir()
+    grant = ["bash", str(REPO / "host/power/nebius-grant-power.sh"), "--tenant-id", "tenant-e00t",
+             "--project-id", "project-e00p", "--instance-name", "TestVM_1", "--out", str(out)]
+
+    r = sh(*grant, "--expires-at", "2027-10-22T00:00:00Z", env=env, check_rc=False)
+    lines = log.read_text().splitlines()
+    cred = out / "rjob-autostop-testvm-1.json"
+    check(r.returncode == 0 and cred.exists() and oct(cred.stat().st_mode & 0o777) == "0o600",
+          f"grant script writes a mode-600 credentials file {r.stderr[-200:]}")
+    check(any(l.startswith("iam access-permit create --parent-id group-e00grp --resource-id computeinstance-e00test "
+                           "--role compute.instance-power-operator") for l in lines),
+          "permit: power-operator, granted to the group, on the instance (not the project)")
+    check(any("iam service-account create --parent-id project-e00p --name rjob-autostop-testvm-1" in l for l in lines)
+          and any("iam group create --parent-id tenant-e00t --name rjob-power-testvm-1" in l for l in lines),
+          "account in the project, group in the tenant, names from the instance")
+    check(any("--expires-at 2027-10-22T00:00:00Z" in l for l in lines), "key expiry passed through")
+    check("nebius-setup-profile.sh" in r.stdout and "--instance-id computeinstance-e00test" in r.stdout,
+          "grant script prints the VM step with the ids filled in")
+    r = sh(*grant, env=env, check_rc=False)
+    check(r.returncode != 0 and "exists" in r.stderr, "grant script never overwrites a credentials file")
+    cred.rename(d / "moved.json")
+    n_create = sum("service-account create" in l for l in log.read_text().splitlines())
+    r = sh(*grant, env=env, check_rc=False)
+    check(r.returncode == 0 and n_create == sum("service-account create" in l for l in log.read_text().splitlines())
+          and r.stdout.count("already exists") == 2, "re-run reuses account, group, membership and permit")
+    r = sh("bash", str(REPO / "host/power/nebius-grant-power.sh"), "--tenant-id", "-x", "--project-id", "p",
+           "--instance-id", "i", env=env, check_rc=False)
+    check(r.returncode != 0 and "bad --tenant-id" in r.stderr, "grant script rejects ids that look like flags")
+
+    etc = d / "etc"
+    src = d / "tmp-cred.json"
+    src.write_text('{"subject-credentials": "secret"}')
+    setup = ["bash", str(REPO / "host/power/nebius-setup-profile.sh"), "--credentials", str(src),
+             "--project-id", "project-e00p", "--instance-id", "computeinstance-e00test",
+             "--worker", getpass.getuser(), "--cli", str(stub)]
+    senv = dict(env, RJOB_POWER_ETC=str(etc))
+    r = sh(*setup, env=senv, check_rc=False)
+    dest = etc / "tmp-cred.json"
+    cfgtext = (etc / "autostop.toml").read_text() if (etc / "autostop.toml").exists() else ""
+    check(r.returncode == 0 and dest.exists() and not src.exists() and oct(dest.stat().st_mode & 0o777) == "0o600"
+          and oct(etc.stat().st_mode & 0o777) == "0o700", f"setup script moves the key into a 700 dir, mode 600 {r.stderr[-300:]}")
+    check('instance_id = "computeinstance-e00test"' in cfgtext and 'profile = "rjob-autostop"' in cfgtext
+          and f'cli = "{stub}"' in cfgtext and f'worker = "{getpass.getuser()}"' in cfgtext and "REPLACE-ME" not in cfgtext,
+          "setup script fills in autostop.toml")
+    check(any(l.startswith("profile create --endpoint api.nebius.cloud --service-account-file " + str(dest))
+              for l in log.read_text().splitlines()), "profile authenticates with the moved key")
+    src.write_text("{}")
+    r = sh(*setup, env=senv, check_rc=False)
+    check(r.returncode == 0 and "exists; left as is" in r.stdout and "already filled in; kept" in r.stdout,
+          "setup re-run keeps the profile and a filled-in config")
+    src.write_text("{}")
+    r = sh(*setup, env=dict(senv, STUB_IAM_RC="0"), check_rc=False)
+    check(r.returncode != 0 and "broader" in r.stderr, "setup refuses a credential that can do more than power operations")
+    src.write_text("{}")
+    r = sh(*setup, env=dict(senv, STUB_STATE="STOPPED"), check_rc=False)
+    check(r.returncode != 0 and "expected RUNNING" in r.stderr, "setup refuses when the VM state is not RUNNING")
+
+
 def wait_state_any(rj, job_id, states, timeout=30):
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -680,6 +773,7 @@ files = ["main.py"]
     print(rjob("list").stdout)
     multi_host()
     autostop()
+    nebius_setup_scripts()
     print(f"\n{len(FAILS)} failures" if FAILS else "\nall checks passed")
     if not FAILS:
         shutil.rmtree(TMP, ignore_errors=True)
