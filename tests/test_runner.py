@@ -1002,6 +1002,18 @@ files = ["main.py"]
     p = subprocess.run([str(HOSTHOME / "rjob/bin/run-job")], input=b"../job.json\n", capture_output=True,
                        env=dict(os.environ, SSH_ORIGINAL_COMMAND=f"fetch {jid}", HOME=str(HOSTHOME)))
     check(p.returncode == 2, "fetch path traversal rejected")
+    # a comma in an output name is legal (C3r2|2,2|8 style ids); paths travel on stdin, not argv
+    jdir = HOSTHOME / "rjob/jobs" / jid
+    cdir = jdir / "work" / json.loads((jdir / "job.json").read_text())["run"].get("outputs", "outputs")
+    (cdir / "a,b").mkdir(parents=True, exist_ok=True)
+    (cdir / "a,b/x,y.txt").write_text("comma")
+    env = dict(os.environ, SSH_ORIGINAL_COMMAND=f"fetch {jid}", HOME=str(HOSTHOME))
+    p = subprocess.run([str(HOSTHOME / "rjob/bin/run-job")], input=b"a,b/x,y.txt\n", capture_output=True, env=env)
+    import io, tarfile
+    names = tarfile.open(fileobj=io.BytesIO(p.stdout), mode="r:gz").getnames() if p.returncode == 0 else []
+    check(names == ["a,b/x,y.txt"], f"fetch accepts a comma in an output path")
+    p = subprocess.run([str(HOSTHOME / "rjob/bin/run-job")], input=b"a,b/../x\n", capture_output=True, env=env)
+    check(p.returncode == 2, "comma path with .. still rejected")
     git(main_repo, "update-ref", "refs/heads/evil", "HEAD")
     bundle = subprocess.run(["git", "-C", str(main_repo), "bundle", "create", "-", "refs/heads/evil"],
                             capture_output=True).stdout
