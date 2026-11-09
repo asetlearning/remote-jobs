@@ -81,7 +81,7 @@ RE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 RE_ID = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
 RE_INT = re.compile(r"^[0-9]{1,6}$")
 GPU_DEVICES = ("mps", "cuda", "gpu", "auto")
-RE_RELPATH = re.compile(r"^(?!/)(?!.*(^|/)\.\.(/|$))[A-Za-z0-9._/+=@-]{1,400}$")
+RE_RELPATH = re.compile(r"^(?!/)(?!.*(^|/)\.\.(/|$))[A-Za-z0-9._/+=@,-]{1,400}$")
 
 TERMINAL = {"done", "failed", "cancelled", "timeout", "dead"}
 ACTIVE = {"building", "running"}
